@@ -1,0 +1,31 @@
+apiVersion: lux.network/v1alpha1
+kind: LuxNetwork
+metadata:
+  name: luxd
+  namespace: lux-devnet
+spec:
+  networkId: 3
+  validators: 5
+  adoptExisting: true
+
+  ports:
+    http: 9650
+    staking: 9651
+
+  consensus:
+    sybilProtectionEnabled: false
+
+  staking:
+    secretName: luxd-staking
+    kms:
+      hostApi: https://kms.hanzo.ai/api
+      projectSlug: lux-infra
+      envSlug: devnet
+      secretsPath: /staking
+      resyncInterval: 300
+      auth:
+        credentialsSecret: universal-auth-credentials
+        credentialsNamespace: lux-system
+
+  chainTracking:
+    trackAllChains: true

@@ -1,0 +1,45 @@
+[package]
+name = "lux-operator"
+version = "0.2.0"
+edition = "2021"
+license = "BSD-3-Clause"
+repository = "https://github.com/luxfi/operator"
+description = "Kubernetes operator for Lux Network"
+
+[[bin]]
+name = "lux-operator"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Kubernetes
+kube = { version = "0.87", features = ["runtime", "derive"] }
+k8s-openapi = { version = "0.20", features = ["v1_28"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4.4", features = ["derive", "env"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP client
+reqwest = { version = "0.11", default-features = false, features = ["json", "native-tls"] }
+
+# HTTP server (health + metrics)
+axum = "0.7"
+
+# Utils
+thiserror = "1.0"
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+schemars = "0.8"
