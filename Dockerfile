@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 && \
     rm -rf /var/lib/apt/lists/*
 
-RUN groupadd -r operator && useradd -r -g operator -s /sbin/nologin operator
+RUN useradd -r -g nogroup -s /sbin/nologin operator
 
 COPY --from=builder /build/target/release/lux-operator /usr/local/bin/lux-operator
 
