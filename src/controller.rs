@@ -1,10 +1,18 @@
 //! Kubernetes controller for LuxNetwork and LuxChain resources
 
-use crate::crd::{ChainRef, ChainStatus, LuxChain, LuxChainStatus, LuxNetwork, LuxNetworkStatus};
+use crate::crd::{
+    ChainRef, ChainStatus, LuxChain, LuxChainStatus, LuxExplorer, LuxExplorerStatus, LuxGateway,
+    LuxGatewayStatus, LuxIndexer, LuxIndexerStatus, LuxNetwork, LuxNetworkStatus,
+};
 use crate::error::{OperatorError, Result};
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::{
-    StatefulSet, StatefulSetPersistentVolumeClaimRetentionPolicy, StatefulSetSpec,
+    Deployment, DeploymentSpec, StatefulSet, StatefulSetPersistentVolumeClaimRetentionPolicy,
+    StatefulSetSpec,
+};
+use k8s_openapi::api::networking::v1::{
+    HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule, IngressSpec,
+    IngressTLS, ServiceBackendPort,
 };
 use k8s_openapi::api::core::v1::{
     ConfigMap, Container, ContainerPort, EnvVar, LocalObjectReference,
@@ -99,6 +107,96 @@ pub async fn run_chain_controller(client: Client, namespace: String) -> Result<(
             match res {
                 Ok(o) => info!("Reconciled chain: {:?}", o),
                 Err(e) => error!("Chain reconcile error: {:?}", e),
+            }
+        })
+        .await;
+
+    Ok(())
+}
+
+// ───────────────────────── LuxIndexer Controller ─────────────────────────
+
+/// Run the LuxIndexer controller
+pub async fn run_indexer_controller(client: Client, namespace: String) -> Result<()> {
+    let ctx = Arc::new(Context {
+        client: client.clone(),
+        mpc_endpoint: None,
+    });
+
+    let indexers: Api<LuxIndexer> = if namespace.is_empty() {
+        Api::all(client.clone())
+    } else {
+        Api::namespaced(client.clone(), &namespace)
+    };
+
+    info!("Starting LuxIndexer controller");
+
+    Controller::new(indexers, WatcherConfig::default())
+        .run(reconcile_indexer, indexer_error_policy, ctx)
+        .for_each(|res| async move {
+            match res {
+                Ok(o) => info!("Reconciled indexer: {:?}", o),
+                Err(e) => error!("Indexer reconcile error: {:?}", e),
+            }
+        })
+        .await;
+
+    Ok(())
+}
+
+// ───────────────────────── LuxExplorer Controller ─────────────────────────
+
+/// Run the LuxExplorer controller
+pub async fn run_explorer_controller(client: Client, namespace: String) -> Result<()> {
+    let ctx = Arc::new(Context {
+        client: client.clone(),
+        mpc_endpoint: None,
+    });
+
+    let explorers: Api<LuxExplorer> = if namespace.is_empty() {
+        Api::all(client.clone())
+    } else {
+        Api::namespaced(client.clone(), &namespace)
+    };
+
+    info!("Starting LuxExplorer controller");
+
+    Controller::new(explorers, WatcherConfig::default())
+        .run(reconcile_explorer, explorer_error_policy, ctx)
+        .for_each(|res| async move {
+            match res {
+                Ok(o) => info!("Reconciled explorer: {:?}", o),
+                Err(e) => error!("Explorer reconcile error: {:?}", e),
+            }
+        })
+        .await;
+
+    Ok(())
+}
+
+// ───────────────────────── LuxGateway Controller ─────────────────────────
+
+/// Run the LuxGateway controller
+pub async fn run_gateway_controller(client: Client, namespace: String) -> Result<()> {
+    let ctx = Arc::new(Context {
+        client: client.clone(),
+        mpc_endpoint: None,
+    });
+
+    let gateways: Api<LuxGateway> = if namespace.is_empty() {
+        Api::all(client.clone())
+    } else {
+        Api::namespaced(client.clone(), &namespace)
+    };
+
+    info!("Starting LuxGateway controller");
+
+    Controller::new(gateways, WatcherConfig::default())
+        .run(reconcile_gateway, gateway_error_policy, ctx)
+        .for_each(|res| async move {
+            match res {
+                Ok(o) => info!("Reconciled gateway: {:?}", o),
+                Err(e) => error!("Gateway reconcile error: {:?}", e),
             }
         })
         .await;
@@ -341,7 +439,46 @@ async fn reconcile_network(network: Arc<LuxNetwork>, ctx: Arc<Context>) -> Resul
                     }
                 }
 
-                check_health(&network, &ctx).await?
+                let mut health_status = check_health(&network, &ctx).await?;
+
+                // Check if snapshot is due (non-blocking, best-effort)
+                if network.spec.snapshot_schedule.enabled && health_status.phase == "Running" {
+                    match maybe_take_snapshot(&network, &ctx, &health_status).await {
+                        Ok(Some(snap_status)) => {
+                            let snap_url = snap_status.url.clone();
+                            health_status.last_snapshot_time = Some(snap_status.timestamp);
+                            health_status.last_snapshot_url = Some(snap_status.url);
+                            health_status.last_snapshot_version = snap_status.version;
+                            health_status.snapshot_count = snap_status.count;
+                            info!("Network {} snapshot completed: {}", name, snap_url);
+                        }
+                        Ok(None) => {
+                            // Not due yet, preserve existing snapshot status
+                            let prev = network.status.clone().unwrap_or_default();
+                            health_status.last_snapshot_time = prev.last_snapshot_time;
+                            health_status.last_snapshot_url = prev.last_snapshot_url;
+                            health_status.last_snapshot_version = prev.last_snapshot_version;
+                            health_status.snapshot_count = prev.snapshot_count;
+                        }
+                        Err(e) => {
+                            warn!("Network {} snapshot failed (non-fatal): {}", name, e);
+                            let prev = network.status.clone().unwrap_or_default();
+                            health_status.last_snapshot_time = prev.last_snapshot_time;
+                            health_status.last_snapshot_url = prev.last_snapshot_url;
+                            health_status.last_snapshot_version = prev.last_snapshot_version;
+                            health_status.snapshot_count = prev.snapshot_count;
+                        }
+                    }
+                } else {
+                    // Preserve existing snapshot status
+                    let prev = network.status.clone().unwrap_or_default();
+                    health_status.last_snapshot_time = prev.last_snapshot_time;
+                    health_status.last_snapshot_url = prev.last_snapshot_url;
+                    health_status.last_snapshot_version = prev.last_snapshot_version;
+                    health_status.snapshot_count = prev.snapshot_count;
+                }
+
+                health_status
             }
         }
         "Degraded" => {
@@ -359,6 +496,7 @@ async fn reconcile_network(network: Arc<LuxNetwork>, ctx: Arc<Context>) -> Resul
         || new_status.ready_validators != current_status.ready_validators
         || new_status.chain_statuses != current_status.chain_statuses
         || new_status.external_ips != current_status.external_ips
+        || new_status.last_snapshot_time != current_status.last_snapshot_time
     {
         let patch = Patch::Merge(serde_json::json!({ "status": new_status }));
         networks
@@ -1053,26 +1191,15 @@ fn generate_startup_script(network: &LuxNetwork) -> String {
     s.push_str("  sleep 1\n");
     s.push_str("done\n\n");
 
-    // Chain aliases
-    if !spec.chain_tracking.aliases.is_empty() {
+    // Chain aliases: map blockchain_id -> human-readable alias via admin.aliasChain
+    if !spec.chains.is_empty() {
         s.push_str("# Set up chain aliases\n");
-        for alias in &spec.chain_tracking.aliases {
+        for chain_ref in &spec.chains {
             s.push_str(&format!(
-                "curl -s -m 5 -X POST -H 'Content-Type: application/json' \\\n  --data '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin.aliasChain\",\"params\":{{\"chain\":\"C\",\"alias\":\"{}\"}}}}' \\\n  http://127.0.0.1:{}/ext/admin >/dev/null 2>&1 || true\n",
-                alias, http_port
+                "curl -s -m 5 -X POST -H 'Content-Type: application/json' \\\n  --data '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin.aliasChain\",\"params\":{{\"chain\":\"{}\",\"alias\":\"{}\"}}}}' \\\n  http://127.0.0.1:{}/ext/admin >/dev/null 2>&1 || true\n",
+                chain_ref.blockchain_id, chain_ref.alias, http_port
             ));
         }
-        s.push('\n');
-    }
-
-    // Chain aliases for additional chains
-    for chain_ref in &spec.chains {
-        s.push_str(&format!(
-            "curl -s -m 5 -X POST -H 'Content-Type: application/json' \\\n  --data '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin.aliasChain\",\"params\":{{\"chain\":\"{}\",\"alias\":\"{}\"}}}}' \\\n  http://127.0.0.1:{}/ext/admin >/dev/null 2>&1 || true\n",
-            chain_ref.blockchain_id, chain_ref.alias, http_port
-        ));
-    }
-    if !spec.chains.is_empty() {
         s.push('\n');
     }
 
@@ -3171,6 +3298,336 @@ async fn get_evm_block_height(
     }
 }
 
+// ───────────────────────── Snapshot Management ─────────────────────────
+
+/// Result of a successful snapshot operation
+struct SnapshotResult {
+    timestamp: String,
+    url: String,
+    version: Option<u64>,
+    count: u32,
+}
+
+/// Check if a snapshot is due and manage the snapshot lifecycle.
+///
+/// Uses a two-phase approach to avoid blocking the reconcile loop:
+/// - Phase 1: Trigger admin.snapshot + launch background tar/upload in the pod
+/// - Phase 2: Check if the background job completed (marker file)
+///
+/// Returns Ok(Some(result)) if snapshot completed, Ok(None) if not due or in-progress.
+async fn maybe_take_snapshot(
+    network: &LuxNetwork,
+    ctx: &Context,
+    _health_status: &LuxNetworkStatus,
+) -> Result<Option<SnapshotResult>> {
+    let schedule = &network.spec.snapshot_schedule;
+    if !schedule.enabled || schedule.object_store_endpoint.is_empty() {
+        return Ok(None);
+    }
+
+    let name = network.name_any();
+    let namespace = network.namespace().unwrap_or_else(|| "default".to_string());
+    let spec = &network.spec;
+    let http_port = spec.ports.http;
+    let source_idx = schedule.source_node_index;
+
+    // Find the source pod
+    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &namespace);
+    let labels = pod_label_selector(&name, spec.adopt_existing);
+    let pod_list = pods
+        .list(&ListParams::default().labels(&labels))
+        .await
+        .map_err(OperatorError::KubeApi)?;
+
+    let source_pod = pod_list
+        .items
+        .iter()
+        .find(|pod| {
+            pod.metadata
+                .name
+                .as_ref()
+                .map(|n| n.ends_with(&format!("-{}", source_idx)))
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| {
+            OperatorError::Reconcile(format!("Source pod {}-{} not found", name, source_idx))
+        })?;
+
+    let pod_ip = source_pod
+        .status
+        .as_ref()
+        .and_then(|s| s.pod_ip.clone())
+        .ok_or_else(|| OperatorError::Reconcile("Source pod has no IP".to_string()))?;
+
+    let pod_name = source_pod
+        .metadata
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("{}-{}", name, source_idx));
+
+    // Marker files used to track background snapshot progress
+    let progress_marker = "/tmp/snapshot-in-progress";
+    let done_marker = "/tmp/snapshot-done";
+
+    // Phase 2: Check if a previous background snapshot completed
+    let check_result = exec_in_pod(
+        &ctx.client,
+        &namespace,
+        &pod_name,
+        &["sh", "-c", &format!(
+            "if [ -f {} ]; then cat {}; elif [ -f {} ]; then echo IN_PROGRESS; else echo IDLE; fi",
+            done_marker, done_marker, progress_marker
+        )],
+    )
+    .await;
+
+    if let Ok(ref output) = check_result {
+        let output = output.trim();
+        if output == "IN_PROGRESS" {
+            debug!("Network {} snapshot still in progress on {}", name, pod_name);
+            return Ok(None);
+        }
+        if output.starts_with("DONE|") {
+            // Background snapshot completed! Parse result and clean up markers.
+            let parts: Vec<&str> = output.splitn(4, '|').collect();
+            // Format: DONE|<url>|<version>|<timestamp>
+            let snap_url = parts.get(1).unwrap_or(&"").to_string();
+            let snap_version = parts.get(2).and_then(|v| v.parse::<u64>().ok());
+            let snap_time = parts.get(3).unwrap_or(&"").to_string();
+
+            // Clean up markers
+            let _ = exec_in_pod(
+                &ctx.client,
+                &namespace,
+                &pod_name,
+                &["sh", "-c", &format!("rm -f {} {}", progress_marker, done_marker)],
+            )
+            .await;
+
+            let status = network.status.clone().unwrap_or_default();
+            info!("Network {} snapshot completed: {}", name, snap_url);
+            return Ok(Some(SnapshotResult {
+                timestamp: if snap_time.is_empty() {
+                    chrono::Utc::now().to_rfc3339()
+                } else {
+                    snap_time
+                },
+                url: snap_url,
+                version: snap_version,
+                count: status.snapshot_count + 1,
+            }));
+        }
+        if output.starts_with("DONE") {
+            // Old format (DONE:...) from previous operator version — clean up stale marker
+            warn!("Network {} found stale DONE marker (old format), cleaning up", name);
+            let _ = exec_in_pod(
+                &ctx.client,
+                &namespace,
+                &pod_name,
+                &["sh", "-c", &format!("rm -f {} {}", progress_marker, done_marker)],
+            )
+            .await;
+            // Fall through to interval check — will trigger fresh snapshot
+        }
+        // IDLE — fall through to check if we should start a new snapshot
+    }
+
+    // Check if snapshot is due based on last snapshot time
+    let status = network.status.clone().unwrap_or_default();
+    if let Some(ref last_time) = status.last_snapshot_time {
+        if let Ok(last_dt) = chrono::DateTime::parse_from_rfc3339(last_time) {
+            let elapsed = chrono::Utc::now()
+                .signed_duration_since(last_dt)
+                .num_seconds() as u64;
+            if elapsed < schedule.interval_seconds {
+                return Ok(None);
+            }
+        }
+    }
+
+    // Phase 1: Trigger admin.snapshot and launch background tar+upload
+    info!(
+        "Network {} taking snapshot from node {} (interval={}s)",
+        name, source_idx, schedule.interval_seconds
+    );
+
+    // Step 1: Trigger admin.snapshot (fast HTTP call)
+    let snapshot_version = trigger_admin_snapshot(&pod_ip, http_port).await?;
+    info!(
+        "Network {} admin.snapshot returned version {} on {}",
+        name, snapshot_version, pod_name
+    );
+
+    // Step 2: Build the background script that does the heavy lifting
+    let bucket = &schedule.bucket;
+    let prefix = if schedule.prefix.is_empty() {
+        name.clone()
+    } else {
+        schedule.prefix.trim_end_matches('/').to_string()
+    };
+    let archive_name = format!("{}-node{}-full.tar.gz", prefix, source_idx);
+    let archive_path = format!("/tmp/{}", archive_name);
+    let object_key = format!("{}/{}", prefix, archive_name);
+    let endpoint = &schedule.object_store_endpoint;
+    let access_key = schedule.access_key.as_deref().unwrap_or("hanzo");
+    let secret_key_ref = schedule.secret_key_ref.as_deref().unwrap_or("hanzo-minio-secret");
+    let snapshot_url = format!("{}/{}/{}", endpoint, bucket, object_key);
+    let now_rfc3339 = chrono::Utc::now().to_rfc3339();
+
+    // Build RLP export commands if configured
+    let mut rlp_cmds = String::new();
+    if schedule.include_rlp_exports {
+        // C-chain RLP export
+        rlp_cmds.push_str(&format!(
+            concat!(
+                "curl -sf -X POST -H 'Content-Type: application/json' ",
+                "-d '{{\"jsonrpc\":\"2.0\",\"method\":\"admin_exportChain\",\"params\":[\"/tmp/cchain.rlp\"],\"id\":1}}' ",
+                "http://127.0.0.1:{}/ext/bc/C/rpc >/dev/null 2>&1 || true; ",
+            ),
+            http_port,
+        ));
+    }
+
+    // The background script: tar + upload + cleanup + write done marker
+    let bg_script = format!(
+        concat!(
+            "echo $$ > {progress}; ",
+            "{rlp_cmds}",
+            "tar czf {archive} -C /data --exclude='*.log' --exclude='LOCK' db chainData genesis.bytes 2>/dev/null; ",
+            "MC=/tmp/mc; ",
+            "if [ ! -f $MC ]; then ",
+            "  curl -sfL https://dl.min.io/client/mc/release/linux-amd64/mc -o $MC 2>/dev/null && chmod +x $MC; ",
+            "fi; ",
+            "RESULT=FAIL; ",
+            "if [ -f $MC ]; then ",
+            "  $MC alias set snap {endpoint} {access_key} {secret_key} --api s3v4 2>/dev/null; ",
+            "  if $MC cp {archive} snap/{bucket}/{key} 2>/dev/null; then RESULT=OK; fi; ",
+            "fi; ",
+            "rm -f {archive} /tmp/*.rlp {progress}; ",
+            "if [ \"$RESULT\" = \"OK\" ]; then ",
+            "  echo 'DONE|{url}|{version}|{time}' > {done}; ",
+            "else ",
+            "  echo 'DONE|UPLOAD_FAILED|0|{time}' > {done}; ",
+            "fi",
+        ),
+        progress = progress_marker,
+        rlp_cmds = rlp_cmds,
+        archive = archive_path,
+        endpoint = endpoint,
+        access_key = access_key,
+        secret_key = secret_key_ref,
+        bucket = bucket,
+        key = object_key,
+        url = snapshot_url,
+        version = snapshot_version,
+        time = now_rfc3339,
+        done = done_marker,
+    );
+
+    // Launch as background process via nohup — exec returns immediately
+    let launch_cmd = format!("nohup sh -c '{}' >/tmp/snapshot.log 2>&1 &", bg_script.replace('\'', "'\\''"));
+    let launch_result = exec_in_pod(
+        &ctx.client,
+        &namespace,
+        &pod_name,
+        &["sh", "-c", &launch_cmd],
+    )
+    .await;
+
+    match launch_result {
+        Ok(_) => {
+            info!("Network {} snapshot background job launched on {}", name, pod_name);
+        }
+        Err(ref e) => {
+            warn!("Network {} failed to launch snapshot job: {}", name, e);
+        }
+    }
+
+    // Return None — snapshot is in progress, will be picked up on next reconcile
+    Ok(None)
+}
+
+/// Trigger admin.snapshot on a node, returns the snapshot version number
+async fn trigger_admin_snapshot(pod_ip: &str, http_port: i32) -> Result<u64> {
+    let url = format!("http://{}:{}/ext/admin", pod_ip, http_port);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| OperatorError::Reconcile(format!("HTTP client error: {}", e)))?;
+
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "admin.snapshot",
+            "params": {
+                "path": "/data/snapshots/operator",
+                "since": 0
+            }
+        }))
+        .send()
+        .await
+        .map_err(|e| OperatorError::Reconcile(format!("admin.snapshot failed: {}", e)))?;
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| OperatorError::Reconcile(format!("admin.snapshot parse error: {}", e)))?;
+
+    let version = body
+        .get("result")
+        .and_then(|r| r.get("version"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    Ok(version)
+}
+
+/// Execute a command inside a pod and return stdout.
+/// Uses kube-rs exec API (requires `ws` feature on `kube` crate).
+async fn exec_in_pod(
+    client: &Client,
+    namespace: &str,
+    pod_name: &str,
+    command: &[&str],
+) -> Result<String> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let cmd: Vec<String> = command.iter().map(|s| s.to_string()).collect();
+
+    let mut attached = pods
+        .exec(
+            pod_name,
+            cmd,
+            &kube::api::AttachParams::default()
+                .stdout(true)
+                .stderr(true),
+        )
+        .await
+        .map_err(|e| OperatorError::Reconcile(format!("exec failed on {}: {}", pod_name, e)))?;
+
+    // Collect stdout before joining (join consumes the process)
+    let stdout = {
+        let mut buf = Vec::new();
+        if let Some(mut reader) = attached.stdout() {
+            use tokio::io::AsyncReadExt;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(300),
+                reader.read_to_end(&mut buf),
+            )
+            .await;
+        }
+        buf
+    };
+
+    // Wait for process to complete
+    let _ = attached.join().await;
+
+    let output = String::from_utf8_lossy(&stdout).to_string();
+    Ok(output)
+}
+
 // ───────────────────────── Helpers ─────────────────────────
 
 /// Build pod label selector string
@@ -3234,25 +3691,25 @@ fn build_resource_requirements(spec: &crate::crd::ResourceSpec) -> ResourceRequi
     if let Some(cpu) = &spec.cpu_request {
         requests.insert("cpu".to_string(), Quantity(cpu.clone()));
     } else {
-        requests.insert("cpu".to_string(), Quantity("500m".to_string()));
+        requests.insert("cpu".to_string(), Quantity("100m".to_string()));
     }
 
     if let Some(mem) = &spec.memory_request {
         requests.insert("memory".to_string(), Quantity(mem.clone()));
     } else {
-        requests.insert("memory".to_string(), Quantity("1Gi".to_string()));
+        requests.insert("memory".to_string(), Quantity("256Mi".to_string()));
     }
 
     if let Some(cpu) = &spec.cpu_limit {
         limits.insert("cpu".to_string(), Quantity(cpu.clone()));
     } else {
-        limits.insert("cpu".to_string(), Quantity("2".to_string()));
+        limits.insert("cpu".to_string(), Quantity("1".to_string()));
     }
 
     if let Some(mem) = &spec.memory_limit {
         limits.insert("memory".to_string(), Quantity(mem.clone()));
     } else {
-        limits.insert("memory".to_string(), Quantity("4Gi".to_string()));
+        limits.insert("memory".to_string(), Quantity("1Gi".to_string()));
     }
 
     ResourceRequirements {
@@ -3288,6 +3745,1267 @@ fn network_error_policy(
     error!(
         "Error reconciling network {}: {:?}",
         network.name_any(),
+        error
+    );
+    Action::requeue(Duration::from_secs(30))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LuxIndexer Reconciler
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn reconcile_indexer(indexer: Arc<LuxIndexer>, ctx: Arc<Context>) -> Result<Action> {
+    let name = indexer.name_any();
+    let namespace = indexer.namespace().unwrap_or_else(|| "default".to_string());
+    let spec = &indexer.spec;
+
+    info!("Reconciling LuxIndexer {}/{}", namespace, name);
+
+    let indexers_api: Api<LuxIndexer> = Api::namespaced(ctx.client.clone(), &namespace);
+    let current_status = indexer.status.clone().unwrap_or_default();
+    let phase = current_status.phase.as_str();
+
+    let new_status = match phase {
+        "" | "Pending" => {
+            info!("Indexer {}: Creating resources", name);
+            create_indexer_resources(&ctx.client, &namespace, &name, spec, &indexer).await?;
+            LuxIndexerStatus {
+                phase: "Syncing".to_string(),
+                database_ready: spec.database.managed,
+                ..current_status
+            }
+        }
+        "Creating" | "Syncing" | "Ready" => {
+            // Check if Deployment exists and is ready
+            let deploy_api: Api<Deployment> =
+                Api::namespaced(ctx.client.clone(), &namespace);
+            match deploy_api.get(&format!("{}-indexer", name)).await {
+                Ok(deploy) => {
+                    let ready = deploy
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.ready_replicas)
+                        .unwrap_or(0);
+                    let new_phase = if ready > 0 { "Ready" } else { "Syncing" };
+                    LuxIndexerStatus {
+                        phase: new_phase.to_string(),
+                        api_endpoint: Some(format!(
+                            "http://{}-indexer.{}.svc:{}",
+                            name, namespace, spec.port
+                        )),
+                        database_ready: true,
+                        ..current_status
+                    }
+                }
+                Err(_) => {
+                    // Resources missing, recreate
+                    create_indexer_resources(&ctx.client, &namespace, &name, spec, &indexer)
+                        .await?;
+                    LuxIndexerStatus {
+                        phase: "Creating".to_string(),
+                        ..current_status
+                    }
+                }
+            }
+        }
+        "Error" => {
+            warn!("Indexer {} in Error state, retrying", name);
+            create_indexer_resources(&ctx.client, &namespace, &name, spec, &indexer).await?;
+            LuxIndexerStatus {
+                phase: "Syncing".to_string(),
+                ..current_status
+            }
+        }
+        _ => current_status,
+    };
+
+    // Update status
+    let patch = serde_json::json!({ "status": new_status });
+    indexers_api
+        .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .map_err(OperatorError::KubeApi)?;
+
+    Ok(Action::requeue(Duration::from_secs(60)))
+}
+
+/// Create all K8s resources for an indexer
+async fn create_indexer_resources(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    spec: &crate::crd::LuxIndexerSpec,
+    indexer: &LuxIndexer,
+) -> Result<()> {
+    let labels = indexer_labels(name, &spec.chain_alias);
+    let owner_ref = indexer_owner_reference(indexer);
+
+    // Resolve RPC endpoint
+    let rpc_endpoint = spec.rpc_endpoint.clone().unwrap_or_else(|| {
+        // Auto-discover from LuxNetwork: headless service on default port
+        format!(
+            "http://{}-0.{}-headless.{}.svc:9630/ext/bc/{}/rpc",
+            spec.network_ref, spec.network_ref, namespace,
+            spec.blockchain_id.as_deref().unwrap_or("C")
+        )
+    });
+
+    let ws_endpoint = spec.ws_endpoint.clone().unwrap_or_else(|| {
+        format!(
+            "ws://{}-0.{}-headless.{}.svc:9630/ext/bc/{}/ws",
+            spec.network_ref, spec.network_ref, namespace,
+            spec.blockchain_id.as_deref().unwrap_or("C")
+        )
+    });
+
+    // Database URL
+    let db_name = spec
+        .database
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("indexer_{}", spec.chain_alias.replace('-', "_")));
+
+    let db_url = if spec.database.managed {
+        // Create managed PostgreSQL StatefulSet
+        create_indexer_postgres(client, namespace, name, spec, &labels, &owner_ref).await?;
+        format!(
+            "postgres://indexer:indexer@{}-pg.{}.svc:5432/{}?sslmode=disable",
+            name, namespace, db_name
+        )
+    } else {
+        spec.database
+            .url
+            .clone()
+            .unwrap_or_else(|| "postgres://localhost:5432/indexer".to_string())
+    };
+
+    // Indexer Deployment
+    let deploy_name = format!("{}-indexer", name);
+    let image = format!("{}:{}", spec.image.repository, spec.image.tag);
+
+    let mut env_vars = vec![
+        EnvVar {
+            name: "DATABASE_URL".to_string(),
+            value: Some(db_url),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "RPC_ENDPOINT".to_string(),
+            value: Some(rpc_endpoint),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "WS_ENDPOINT".to_string(),
+            value: Some(ws_endpoint),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "CHAIN_ID".to_string(),
+            value: Some(spec.chain_id.to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "CHAIN_ALIAS".to_string(),
+            value: Some(spec.chain_alias.clone()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "HTTP_PORT".to_string(),
+            value: Some(spec.port.to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "POLL_INTERVAL".to_string(),
+            value: Some(spec.poll_interval.to_string()),
+            ..Default::default()
+        },
+    ];
+
+    if spec.trace_enabled {
+        env_vars.push(EnvVar {
+            name: "TRACE_ENABLED".to_string(),
+            value: Some("true".to_string()),
+            ..Default::default()
+        });
+    }
+    if spec.defi_indexing {
+        env_vars.push(EnvVar {
+            name: "DEFI_INDEXING".to_string(),
+            value: Some("true".to_string()),
+            ..Default::default()
+        });
+    }
+    if spec.nft_indexing {
+        env_vars.push(EnvVar {
+            name: "NFT_INDEXING".to_string(),
+            value: Some("true".to_string()),
+            ..Default::default()
+        });
+    }
+
+    let deployment = Deployment {
+        metadata: kube::core::ObjectMeta {
+            name: Some(deploy_name.clone()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(labels.clone()),
+            owner_references: Some(vec![owner_ref.clone()]),
+            ..Default::default()
+        },
+        spec: Some(DeploymentSpec {
+            replicas: Some(spec.replicas),
+            selector: LabelSelector {
+                match_labels: Some(labels.clone()),
+                ..Default::default()
+            },
+            template: PodTemplateSpec {
+                metadata: Some(kube::core::ObjectMeta {
+                    labels: Some(labels.clone()),
+                    ..Default::default()
+                }),
+                spec: Some(PodSpec {
+                    containers: vec![Container {
+                        name: "indexer".to_string(),
+                        image: Some(image),
+                        image_pull_policy: Some(spec.image.pull_policy.clone()),
+                        args: Some({
+                            // Map chain alias to indexer chain type
+                            // All EVM chains (C-chain + subnets) use "cchain"
+                            let chain_type = match spec.chain_alias.to_lowercase().as_str() {
+                                "p" | "pchain" => "pchain",
+                                "x" | "xchain" => "xchain",
+                                _ => "cchain", // C-chain and all EVM subnet chains
+                            };
+                            vec![
+                                "-chain".to_string(),
+                                chain_type.to_string(),
+                            ]
+                        }),
+                        ports: Some(vec![ContainerPort {
+                            container_port: spec.port,
+                            name: Some("http".to_string()),
+                            ..Default::default()
+                        }]),
+                        env: Some(env_vars),
+                        resources: Some(build_resource_requirements(&spec.resources)),
+                        liveness_probe: Some(Probe {
+                            http_get: Some(
+                                k8s_openapi::api::core::v1::HTTPGetAction {
+                                    path: Some("/health".to_string()),
+                                    port: IntOrString::Int(spec.port),
+                                    ..Default::default()
+                                },
+                            ),
+                            initial_delay_seconds: Some(30),
+                            period_seconds: Some(30),
+                            ..Default::default()
+                        }),
+                        readiness_probe: Some(Probe {
+                            http_get: Some(
+                                k8s_openapi::api::core::v1::HTTPGetAction {
+                                    path: Some("/health".to_string()),
+                                    port: IntOrString::Int(spec.port),
+                                    ..Default::default()
+                                },
+                            ),
+                            initial_delay_seconds: Some(10),
+                            period_seconds: Some(10),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    image_pull_secrets: Some(vec![LocalObjectReference {
+                        name: Some("registry-hanzo".to_string()),
+                    }]),
+                    ..Default::default()
+                }),
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let deploy_api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    apply_resource(&deploy_api, &deploy_name, &deployment).await?;
+
+    // Service for indexer API
+    let svc_name = format!("{}-indexer", name);
+    let svc = Service {
+        metadata: kube::core::ObjectMeta {
+            name: Some(svc_name.clone()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(labels.clone()),
+            owner_references: Some(vec![owner_ref]),
+            ..Default::default()
+        },
+        spec: Some(K8sServiceSpec {
+            selector: Some(labels),
+            ports: Some(vec![ServicePort {
+                name: Some("http".to_string()),
+                port: spec.port,
+                target_port: Some(IntOrString::Int(spec.port)),
+                ..Default::default()
+            }]),
+            type_: Some("ClusterIP".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let svc_api: Api<Service> = Api::namespaced(client.clone(), namespace);
+    apply_resource(&svc_api, &svc_name, &svc).await?;
+
+    info!("Created indexer resources for {}/{}", namespace, name);
+    Ok(())
+}
+
+/// Create managed PostgreSQL StatefulSet for an indexer
+async fn create_indexer_postgres(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    spec: &crate::crd::LuxIndexerSpec,
+    parent_labels: &BTreeMap<String, String>,
+    owner_ref: &OwnerReference,
+) -> Result<()> {
+    let pg_name = format!("{}-pg", name);
+    let mut pg_labels = parent_labels.clone();
+    pg_labels.insert("component".to_string(), "postgresql".to_string());
+
+    let db_name = spec
+        .database
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("indexer_{}", spec.chain_alias.replace('-', "_")));
+
+    let pg_sts = StatefulSet {
+        metadata: kube::core::ObjectMeta {
+            name: Some(pg_name.clone()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(pg_labels.clone()),
+            owner_references: Some(vec![owner_ref.clone()]),
+            ..Default::default()
+        },
+        spec: Some(StatefulSetSpec {
+            replicas: Some(1),
+            service_name: pg_name.clone(),
+            selector: LabelSelector {
+                match_labels: Some(pg_labels.clone()),
+                ..Default::default()
+            },
+            template: PodTemplateSpec {
+                metadata: Some(kube::core::ObjectMeta {
+                    labels: Some(pg_labels.clone()),
+                    ..Default::default()
+                }),
+                spec: Some(PodSpec {
+                    containers: vec![Container {
+                        name: "postgres".to_string(),
+                        image: Some(spec.database.image.clone()),
+                        ports: Some(vec![ContainerPort {
+                            container_port: 5432,
+                            name: Some("pg".to_string()),
+                            ..Default::default()
+                        }]),
+                        env: Some(vec![
+                            EnvVar {
+                                name: "POSTGRES_DB".to_string(),
+                                value: Some(db_name),
+                                ..Default::default()
+                            },
+                            EnvVar {
+                                name: "POSTGRES_USER".to_string(),
+                                value: Some("indexer".to_string()),
+                                ..Default::default()
+                            },
+                            EnvVar {
+                                name: "POSTGRES_PASSWORD".to_string(),
+                                value: Some("indexer".to_string()),
+                                ..Default::default()
+                            },
+                            EnvVar {
+                                name: "PGDATA".to_string(),
+                                value: Some("/var/lib/postgresql/data/pgdata".to_string()),
+                                ..Default::default()
+                            },
+                        ]),
+                        volume_mounts: Some(vec![VolumeMount {
+                            name: "pg-data".to_string(),
+                            mount_path: "/var/lib/postgresql/data".to_string(),
+                            ..Default::default()
+                        }]),
+                        readiness_probe: Some(Probe {
+                            exec: Some(k8s_openapi::api::core::v1::ExecAction {
+                                command: Some(vec![
+                                    "pg_isready".to_string(),
+                                    "-U".to_string(),
+                                    "indexer".to_string(),
+                                ]),
+                            }),
+                            initial_delay_seconds: Some(5),
+                            period_seconds: Some(10),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            },
+            volume_claim_templates: Some(vec![PersistentVolumeClaim {
+                metadata: kube::core::ObjectMeta {
+                    name: Some("pg-data".to_string()),
+                    ..Default::default()
+                },
+                spec: Some(PersistentVolumeClaimSpec {
+                    access_modes: Some(vec!["ReadWriteOnce".to_string()]),
+                    resources: Some(ResourceRequirements {
+                        requests: Some({
+                            let mut m = BTreeMap::new();
+                            m.insert(
+                                "storage".to_string(),
+                                Quantity(spec.database.storage_size.clone()),
+                            );
+                            m
+                        }),
+                        ..Default::default()
+                    }),
+                    storage_class_name: spec.database.storage_class.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            persistent_volume_claim_retention_policy: Some(
+                StatefulSetPersistentVolumeClaimRetentionPolicy {
+                    when_deleted: Some("Retain".to_string()),
+                    when_scaled: Some("Retain".to_string()),
+                },
+            ),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), namespace);
+    apply_resource(&sts_api, &pg_name, &pg_sts).await?;
+
+    // Headless service for PostgreSQL
+    let pg_svc = Service {
+        metadata: kube::core::ObjectMeta {
+            name: Some(pg_name.clone()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(pg_labels.clone()),
+            owner_references: Some(vec![owner_ref.clone()]),
+            ..Default::default()
+        },
+        spec: Some(K8sServiceSpec {
+            selector: Some(pg_labels),
+            ports: Some(vec![ServicePort {
+                name: Some("pg".to_string()),
+                port: 5432,
+                target_port: Some(IntOrString::Int(5432)),
+                ..Default::default()
+            }]),
+            cluster_ip: Some("None".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let svc_api: Api<Service> = Api::namespaced(client.clone(), namespace);
+    apply_resource(&svc_api, &pg_name, &pg_svc).await?;
+
+    info!("Created PostgreSQL for indexer {}/{}", namespace, name);
+    Ok(())
+}
+
+fn indexer_labels(name: &str, chain_alias: &str) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    labels.insert("app.kubernetes.io/name".to_string(), "lux-indexer".to_string());
+    labels.insert("app.kubernetes.io/instance".to_string(), name.to_string());
+    labels.insert("app.kubernetes.io/component".to_string(), "indexer".to_string());
+    labels.insert("lux.network/chain".to_string(), chain_alias.to_string());
+    labels.insert("app.kubernetes.io/managed-by".to_string(), "lux-operator".to_string());
+    labels
+}
+
+fn indexer_owner_reference(indexer: &LuxIndexer) -> OwnerReference {
+    OwnerReference {
+        api_version: LuxIndexer::api_version(&()).to_string(),
+        kind: LuxIndexer::kind(&()).to_string(),
+        name: indexer.name_any(),
+        uid: indexer.metadata.uid.clone().unwrap_or_default(),
+        controller: Some(true),
+        block_owner_deletion: Some(true),
+    }
+}
+
+fn indexer_error_policy(
+    indexer: Arc<LuxIndexer>,
+    error: &OperatorError,
+    _ctx: Arc<Context>,
+) -> Action {
+    error!(
+        "Error reconciling indexer {}: {:?}",
+        indexer.name_any(),
+        error
+    );
+    Action::requeue(Duration::from_secs(30))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LuxExplorer Reconciler
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn reconcile_explorer(explorer: Arc<LuxExplorer>, ctx: Arc<Context>) -> Result<Action> {
+    let name = explorer.name_any();
+    let namespace = explorer.namespace().unwrap_or_else(|| "default".to_string());
+    let spec = &explorer.spec;
+
+    info!("Reconciling LuxExplorer {}/{}", namespace, name);
+
+    let explorers_api: Api<LuxExplorer> = Api::namespaced(ctx.client.clone(), &namespace);
+    let current_status = explorer.status.clone().unwrap_or_default();
+    let phase = current_status.phase.as_str();
+
+    let new_status = match phase {
+        "" | "Pending" => {
+            info!("Explorer {}: Creating resources", name);
+            create_explorer_resources(&ctx.client, &namespace, &name, spec, &explorer).await?;
+            LuxExplorerStatus {
+                phase: "Creating".to_string(),
+                ..current_status
+            }
+        }
+        "Creating" | "Ready" => {
+            let deploy_api: Api<Deployment> =
+                Api::namespaced(ctx.client.clone(), &namespace);
+            match deploy_api.get(&format!("{}-explorer", name)).await {
+                Ok(deploy) => {
+                    let ready = deploy
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.ready_replicas)
+                        .unwrap_or(0);
+                    let url = spec
+                        .ingress
+                        .as_ref()
+                        .map(|i| format!("https://{}", i.host));
+                    LuxExplorerStatus {
+                        phase: if ready > 0 { "Ready" } else { "Creating" }.to_string(),
+                        url,
+                        ready_replicas: ready,
+                        ..current_status
+                    }
+                }
+                Err(_) => {
+                    create_explorer_resources(&ctx.client, &namespace, &name, spec, &explorer)
+                        .await?;
+                    LuxExplorerStatus {
+                        phase: "Creating".to_string(),
+                        ..current_status
+                    }
+                }
+            }
+        }
+        "Error" => {
+            warn!("Explorer {} in Error state, retrying", name);
+            create_explorer_resources(&ctx.client, &namespace, &name, spec, &explorer).await?;
+            LuxExplorerStatus {
+                phase: "Creating".to_string(),
+                ..current_status
+            }
+        }
+        _ => current_status,
+    };
+
+    let patch = serde_json::json!({ "status": new_status });
+    explorers_api
+        .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .map_err(OperatorError::KubeApi)?;
+
+    Ok(Action::requeue(Duration::from_secs(60)))
+}
+
+/// Create explorer Deployment, Service, and optional Ingress
+async fn create_explorer_resources(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    spec: &crate::crd::LuxExplorerSpec,
+    explorer: &LuxExplorer,
+) -> Result<()> {
+    let labels = explorer_labels(name);
+    let owner_ref = explorer_owner_reference(explorer);
+    let deploy_name = format!("{}-explorer", name);
+    let image = format!("{}:{}", spec.image.repository, spec.image.tag);
+
+    // Build indexer backend env vars (connect to indexer APIs)
+    let mut env_vars: Vec<EnvVar> = spec
+        .indexer_refs
+        .iter()
+        .enumerate()
+        .flat_map(|(i, chain_ref)| {
+            vec![
+                EnvVar {
+                    name: format!("CHAIN_{}_NAME", i),
+                    value: Some(chain_ref.display_name.clone()),
+                    ..Default::default()
+                },
+                EnvVar {
+                    name: format!("CHAIN_{}_INDEXER", i),
+                    value: Some(format!(
+                        "http://{}-indexer.{}.svc:4000",
+                        chain_ref.indexer_name, namespace
+                    )),
+                    ..Default::default()
+                },
+            ]
+        })
+        .collect();
+
+    env_vars.push(EnvVar {
+        name: "CHAIN_COUNT".to_string(),
+        value: Some(spec.indexer_refs.len().to_string()),
+        ..Default::default()
+    });
+
+    if let Some(branding) = &spec.branding {
+        env_vars.push(EnvVar {
+            name: "NETWORK_NAME".to_string(),
+            value: Some(branding.network_name.clone()),
+            ..Default::default()
+        });
+        if let Some(logo) = &branding.logo_url {
+            env_vars.push(EnvVar {
+                name: "LOGO_URL".to_string(),
+                value: Some(logo.clone()),
+                ..Default::default()
+            });
+        }
+    }
+
+    let deployment = Deployment {
+        metadata: kube::core::ObjectMeta {
+            name: Some(deploy_name.clone()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(labels.clone()),
+            owner_references: Some(vec![owner_ref.clone()]),
+            ..Default::default()
+        },
+        spec: Some(DeploymentSpec {
+            replicas: Some(spec.replicas),
+            selector: LabelSelector {
+                match_labels: Some(labels.clone()),
+                ..Default::default()
+            },
+            template: PodTemplateSpec {
+                metadata: Some(kube::core::ObjectMeta {
+                    labels: Some(labels.clone()),
+                    ..Default::default()
+                }),
+                spec: Some(PodSpec {
+                    containers: vec![Container {
+                        name: "explorer".to_string(),
+                        image: Some(image),
+                        image_pull_policy: Some(spec.image.pull_policy.clone()),
+                        ports: Some(vec![ContainerPort {
+                            container_port: spec.port,
+                            name: Some("http".to_string()),
+                            ..Default::default()
+                        }]),
+                        env: Some(env_vars),
+                        resources: Some(build_resource_requirements(&spec.resources)),
+                        liveness_probe: Some(Probe {
+                            http_get: Some(
+                                k8s_openapi::api::core::v1::HTTPGetAction {
+                                    path: Some("/".to_string()),
+                                    port: IntOrString::Int(spec.port),
+                                    ..Default::default()
+                                },
+                            ),
+                            initial_delay_seconds: Some(15),
+                            period_seconds: Some(30),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    image_pull_secrets: Some(vec![LocalObjectReference {
+                        name: Some("registry-hanzo".to_string()),
+                    }]),
+                    ..Default::default()
+                }),
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let deploy_api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    apply_resource(&deploy_api, &deploy_name, &deployment).await?;
+
+    // ClusterIP Service
+    let svc_name = format!("{}-explorer", name);
+    let svc = Service {
+        metadata: kube::core::ObjectMeta {
+            name: Some(svc_name.clone()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(labels.clone()),
+            owner_references: Some(vec![owner_ref.clone()]),
+            ..Default::default()
+        },
+        spec: Some(K8sServiceSpec {
+            selector: Some(labels.clone()),
+            ports: Some(vec![ServicePort {
+                name: Some("http".to_string()),
+                port: spec.port,
+                target_port: Some(IntOrString::Int(spec.port)),
+                ..Default::default()
+            }]),
+            type_: Some("ClusterIP".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let svc_api: Api<Service> = Api::namespaced(client.clone(), namespace);
+    apply_resource(&svc_api, &svc_name, &svc).await?;
+
+    // Ingress (optional)
+    if let Some(ingress_spec) = &spec.ingress {
+        let ingress_name = format!("{}-explorer", name);
+        let mut annotations = ingress_spec.annotations.clone();
+        annotations.insert(
+            "kubernetes.io/ingress.class".to_string(),
+            ingress_spec.ingress_class.clone(),
+        );
+
+        let ingress = Ingress {
+            metadata: kube::core::ObjectMeta {
+                name: Some(ingress_name.clone()),
+                namespace: Some(namespace.to_string()),
+                labels: Some(labels),
+                annotations: Some(annotations),
+                owner_references: Some(vec![owner_ref]),
+                ..Default::default()
+            },
+            spec: Some(IngressSpec {
+                tls: ingress_spec.tls_secret.as_ref().map(|secret| {
+                    vec![IngressTLS {
+                        hosts: Some(vec![ingress_spec.host.clone()]),
+                        secret_name: Some(secret.clone()),
+                    }]
+                }),
+                rules: Some(vec![IngressRule {
+                    host: Some(ingress_spec.host.clone()),
+                    http: Some(HTTPIngressRuleValue {
+                        paths: vec![HTTPIngressPath {
+                            path: Some("/".to_string()),
+                            path_type: "Prefix".to_string(),
+                            backend: IngressBackend {
+                                service: Some(
+                                    k8s_openapi::api::networking::v1::IngressServiceBackend {
+                                        name: svc_name,
+                                        port: Some(ServiceBackendPort {
+                                            number: Some(spec.port),
+                                            ..Default::default()
+                                        }),
+                                    },
+                                ),
+                                ..Default::default()
+                            },
+                        }],
+                    }),
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let ingress_api: Api<Ingress> = Api::namespaced(client.clone(), namespace);
+        apply_resource(&ingress_api, &ingress_name, &ingress).await?;
+    }
+
+    info!("Created explorer resources for {}/{}", namespace, name);
+    Ok(())
+}
+
+fn explorer_labels(name: &str) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    labels.insert("app.kubernetes.io/name".to_string(), "lux-explorer".to_string());
+    labels.insert("app.kubernetes.io/instance".to_string(), name.to_string());
+    labels.insert("app.kubernetes.io/component".to_string(), "explorer".to_string());
+    labels.insert("app.kubernetes.io/managed-by".to_string(), "lux-operator".to_string());
+    labels
+}
+
+fn explorer_owner_reference(explorer: &LuxExplorer) -> OwnerReference {
+    OwnerReference {
+        api_version: LuxExplorer::api_version(&()).to_string(),
+        kind: LuxExplorer::kind(&()).to_string(),
+        name: explorer.name_any(),
+        uid: explorer.metadata.uid.clone().unwrap_or_default(),
+        controller: Some(true),
+        block_owner_deletion: Some(true),
+    }
+}
+
+fn explorer_error_policy(
+    explorer: Arc<LuxExplorer>,
+    error: &OperatorError,
+    _ctx: Arc<Context>,
+) -> Action {
+    error!(
+        "Error reconciling explorer {}: {:?}",
+        explorer.name_any(),
+        error
+    );
+    Action::requeue(Duration::from_secs(30))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LuxGateway Reconciler
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn reconcile_gateway(gateway: Arc<LuxGateway>, ctx: Arc<Context>) -> Result<Action> {
+    let name = gateway.name_any();
+    let namespace = gateway.namespace().unwrap_or_else(|| "default".to_string());
+    let spec = &gateway.spec;
+
+    info!("Reconciling LuxGateway {}/{}", namespace, name);
+
+    let gateways_api: Api<LuxGateway> = Api::namespaced(ctx.client.clone(), &namespace);
+    let current_status = gateway.status.clone().unwrap_or_default();
+    let phase = current_status.phase.as_str();
+
+    let new_status = match phase {
+        "" | "Pending" => {
+            info!("Gateway {}: Creating resources", name);
+            create_gateway_resources(&ctx.client, &namespace, &name, spec, &gateway).await?;
+            LuxGatewayStatus {
+                phase: "Creating".to_string(),
+                ..current_status
+            }
+        }
+        "Creating" | "Ready" => {
+            let deploy_api: Api<Deployment> =
+                Api::namespaced(ctx.client.clone(), &namespace);
+            match deploy_api.get(&format!("{}-gateway", name)).await {
+                Ok(deploy) => {
+                    let ready = deploy
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.ready_replicas)
+                        .unwrap_or(0);
+
+                    // Count routes
+                    let auto_count: u32 = if spec.auto_routes { 7 } else { 0 }; // C, X, P + 4 subnets
+                    let custom_count = spec.custom_routes.len() as u32;
+
+                    LuxGatewayStatus {
+                        phase: if ready > 0 { "Ready" } else { "Creating" }.to_string(),
+                        route_count: auto_count + custom_count,
+                        ready_replicas: ready,
+                        external_endpoint: Some(format!("https://{}", spec.host)),
+                        ..current_status
+                    }
+                }
+                Err(_) => {
+                    create_gateway_resources(&ctx.client, &namespace, &name, spec, &gateway)
+                        .await?;
+                    LuxGatewayStatus {
+                        phase: "Creating".to_string(),
+                        ..current_status
+                    }
+                }
+            }
+        }
+        "Error" => {
+            warn!("Gateway {} in Error state, retrying", name);
+            create_gateway_resources(&ctx.client, &namespace, &name, spec, &gateway).await?;
+            LuxGatewayStatus {
+                phase: "Creating".to_string(),
+                ..current_status
+            }
+        }
+        _ => current_status,
+    };
+
+    let patch = serde_json::json!({ "status": new_status });
+    gateways_api
+        .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .map_err(OperatorError::KubeApi)?;
+
+    Ok(Action::requeue(Duration::from_secs(60)))
+}
+
+/// Create gateway ConfigMap (KrakenD config), Deployment, Service, and Ingress
+async fn create_gateway_resources(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    spec: &crate::crd::LuxGatewaySpec,
+    gateway: &LuxGateway,
+) -> Result<()> {
+    let labels = gateway_labels(name);
+    let owner_ref = gateway_owner_reference(gateway);
+
+    // Build KrakenD configuration JSON
+    let krakend_config = build_krakend_config(namespace, spec);
+
+    // ConfigMap with KrakenD config
+    let cm_name = format!("{}-gateway-config", name);
+    let mut cm_data = BTreeMap::new();
+    cm_data.insert("krakend.json".to_string(), krakend_config);
+
+    let config_map = ConfigMap {
+        metadata: kube::core::ObjectMeta {
+            name: Some(cm_name.clone()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(labels.clone()),
+            owner_references: Some(vec![owner_ref.clone()]),
+            ..Default::default()
+        },
+        data: Some(cm_data),
+        ..Default::default()
+    };
+
+    let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
+    apply_resource(&cm_api, &cm_name, &config_map).await?;
+
+    // Gateway Deployment
+    let deploy_name = format!("{}-gateway", name);
+    let image = format!("{}:{}", spec.image.repository, spec.image.tag);
+
+    let deployment = Deployment {
+        metadata: kube::core::ObjectMeta {
+            name: Some(deploy_name.clone()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(labels.clone()),
+            owner_references: Some(vec![owner_ref.clone()]),
+            ..Default::default()
+        },
+        spec: Some(DeploymentSpec {
+            replicas: Some(spec.replicas),
+            selector: LabelSelector {
+                match_labels: Some(labels.clone()),
+                ..Default::default()
+            },
+            template: PodTemplateSpec {
+                metadata: Some(kube::core::ObjectMeta {
+                    labels: Some(labels.clone()),
+                    ..Default::default()
+                }),
+                spec: Some(PodSpec {
+                    containers: vec![Container {
+                        name: "krakend".to_string(),
+                        image: Some(image),
+                        image_pull_policy: Some(spec.image.pull_policy.clone()),
+                        ports: Some(vec![ContainerPort {
+                            container_port: spec.port,
+                            name: Some("http".to_string()),
+                            ..Default::default()
+                        }]),
+                        command: Some(vec!["/usr/bin/krakend".to_string()]),
+                        args: Some(vec![
+                            "run".to_string(),
+                            "-c".to_string(),
+                            "/etc/krakend/krakend.json".to_string(),
+                        ]),
+                        volume_mounts: Some(vec![VolumeMount {
+                            name: "config".to_string(),
+                            mount_path: "/etc/krakend".to_string(),
+                            read_only: Some(true),
+                            ..Default::default()
+                        }]),
+                        resources: Some(build_resource_requirements(&spec.resources)),
+                        liveness_probe: Some(Probe {
+                            http_get: Some(
+                                k8s_openapi::api::core::v1::HTTPGetAction {
+                                    path: Some("/__health".to_string()),
+                                    port: IntOrString::Int(spec.port),
+                                    ..Default::default()
+                                },
+                            ),
+                            initial_delay_seconds: Some(10),
+                            period_seconds: Some(15),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    volumes: Some(vec![Volume {
+                        name: "config".to_string(),
+                        config_map: Some(k8s_openapi::api::core::v1::ConfigMapVolumeSource {
+                            name: Some(cm_name),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let deploy_api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    apply_resource(&deploy_api, &deploy_name, &deployment).await?;
+
+    // LoadBalancer Service
+    let svc_name = format!("{}-gateway", name);
+    let svc = Service {
+        metadata: kube::core::ObjectMeta {
+            name: Some(svc_name.clone()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(labels.clone()),
+            owner_references: Some(vec![owner_ref.clone()]),
+            ..Default::default()
+        },
+        spec: Some(K8sServiceSpec {
+            selector: Some(labels.clone()),
+            ports: Some(vec![ServicePort {
+                name: Some("http".to_string()),
+                port: 80,
+                target_port: Some(IntOrString::Int(spec.port)),
+                ..Default::default()
+            }]),
+            type_: Some("LoadBalancer".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let svc_api: Api<Service> = Api::namespaced(client.clone(), namespace);
+    apply_resource(&svc_api, &svc_name, &svc).await?;
+
+    // Ingress (if TLS configured)
+    if let Some(tls) = &spec.tls {
+        let ingress_name = format!("{}-gateway", name);
+        let mut annotations = BTreeMap::new();
+        annotations.insert(
+            "kubernetes.io/ingress.class".to_string(),
+            "nginx".to_string(),
+        );
+        if tls.cert_manager {
+            if let Some(issuer) = &tls.issuer {
+                annotations.insert(
+                    "cert-manager.io/cluster-issuer".to_string(),
+                    issuer.clone(),
+                );
+            }
+        }
+
+        let ingress = Ingress {
+            metadata: kube::core::ObjectMeta {
+                name: Some(ingress_name.clone()),
+                namespace: Some(namespace.to_string()),
+                labels: Some(labels),
+                annotations: Some(annotations),
+                owner_references: Some(vec![owner_ref]),
+                ..Default::default()
+            },
+            spec: Some(IngressSpec {
+                tls: Some(vec![IngressTLS {
+                    hosts: Some(vec![spec.host.clone()]),
+                    secret_name: Some(tls.secret_name.clone()),
+                }]),
+                rules: Some(vec![IngressRule {
+                    host: Some(spec.host.clone()),
+                    http: Some(HTTPIngressRuleValue {
+                        paths: vec![HTTPIngressPath {
+                            path: Some("/".to_string()),
+                            path_type: "Prefix".to_string(),
+                            backend: IngressBackend {
+                                service: Some(
+                                    k8s_openapi::api::networking::v1::IngressServiceBackend {
+                                        name: svc_name,
+                                        port: Some(ServiceBackendPort {
+                                            number: Some(80),
+                                            ..Default::default()
+                                        }),
+                                    },
+                                ),
+                                ..Default::default()
+                            },
+                        }],
+                    }),
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let ingress_api: Api<Ingress> = Api::namespaced(client.clone(), namespace);
+        apply_resource(&ingress_api, &ingress_name, &ingress).await?;
+    }
+
+    info!("Created gateway resources for {}/{}", namespace, name);
+    Ok(())
+}
+
+/// Build KrakenD JSON configuration from gateway spec
+fn build_krakend_config(namespace: &str, spec: &crate::crd::LuxGatewaySpec) -> String {
+    let mut endpoints = Vec::new();
+
+    // Auto-routes for blockchain RPCs
+    if spec.auto_routes {
+        let rpc_backend = format!(
+            "http://{}-headless.{}.svc",
+            spec.network_ref, namespace
+        );
+
+        // C-chain RPC
+        endpoints.push(serde_json::json!({
+            "endpoint": "/ext/bc/C/rpc",
+            "method": "POST",
+            "backend": [{
+                "url_pattern": "/ext/bc/C/rpc",
+                "host": [&rpc_backend],
+                "encoding": "no-op"
+            }],
+            "extra_config": {
+                "qos/ratelimit/router": {
+                    "max_rate": spec.rate_limit.as_ref().map(|r| r.requests_per_second).unwrap_or(100),
+                    "capacity": spec.rate_limit.as_ref().map(|r| r.burst).unwrap_or(200)
+                }
+            }
+        }));
+
+        // C-chain WebSocket
+        endpoints.push(serde_json::json!({
+            "endpoint": "/ext/bc/C/ws",
+            "backend": [{
+                "url_pattern": "/ext/bc/C/ws",
+                "host": [&rpc_backend],
+                "encoding": "no-op"
+            }]
+        }));
+
+        // X-chain
+        endpoints.push(serde_json::json!({
+            "endpoint": "/ext/bc/X",
+            "method": "POST",
+            "backend": [{
+                "url_pattern": "/ext/bc/X",
+                "host": [&rpc_backend],
+                "encoding": "no-op"
+            }]
+        }));
+
+        // P-chain
+        endpoints.push(serde_json::json!({
+            "endpoint": "/ext/bc/P",
+            "method": "POST",
+            "backend": [{
+                "url_pattern": "/ext/bc/P",
+                "host": [&rpc_backend],
+                "encoding": "no-op"
+            }]
+        }));
+
+        // Info API
+        endpoints.push(serde_json::json!({
+            "endpoint": "/ext/info",
+            "method": "POST",
+            "backend": [{
+                "url_pattern": "/ext/info",
+                "host": [&rpc_backend],
+                "encoding": "no-op"
+            }]
+        }));
+
+        // Health
+        endpoints.push(serde_json::json!({
+            "endpoint": "/ext/health",
+            "backend": [{
+                "url_pattern": "/ext/health",
+                "host": [&rpc_backend],
+                "encoding": "no-op"
+            }]
+        }));
+
+        // Indexer API routes
+        for indexer_ref in &spec.indexer_refs {
+            let indexer_backend = format!(
+                "http://{}-indexer.{}.svc:4000",
+                indexer_ref, namespace
+            );
+            endpoints.push(serde_json::json!({
+                "endpoint": format!("/api/indexer/{}", indexer_ref),
+                "backend": [{
+                    "url_pattern": "/",
+                    "host": [&indexer_backend],
+                    "encoding": "no-op"
+                }]
+            }));
+        }
+    }
+
+    // Custom routes
+    for route in &spec.custom_routes {
+        endpoints.push(serde_json::json!({
+            "endpoint": route.path,
+            "method": route.methods.first().unwrap_or(&"GET".to_string()),
+            "backend": [{
+                "url_pattern": route.path,
+                "host": [&route.backend],
+                "encoding": "no-op",
+                "timeout": format!("{}s", route.timeout)
+            }]
+        }));
+    }
+
+    let config = serde_json::json!({
+        "$schema": "https://www.krakend.io/schema/v2.7/krakend.json",
+        "version": 3,
+        "name": format!("Lux Gateway - {}", spec.host),
+        "port": spec.port,
+        "timeout": "30s",
+        "cache_ttl": "0s",
+        "extra_config": {
+            "security/cors": {
+                "allow_origins": spec.cors.allowed_origins,
+                "allow_methods": spec.cors.allowed_methods,
+                "allow_headers": spec.cors.allowed_headers,
+                "expose_headers": ["Content-Length"],
+                "max_age": "12h"
+            }
+        },
+        "endpoints": endpoints
+    });
+
+    serde_json::to_string_pretty(&config).unwrap_or_default()
+}
+
+fn gateway_labels(name: &str) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    labels.insert("app.kubernetes.io/name".to_string(), "lux-gateway".to_string());
+    labels.insert("app.kubernetes.io/instance".to_string(), name.to_string());
+    labels.insert("app.kubernetes.io/component".to_string(), "gateway".to_string());
+    labels.insert("app.kubernetes.io/managed-by".to_string(), "lux-operator".to_string());
+    labels
+}
+
+fn gateway_owner_reference(gateway: &LuxGateway) -> OwnerReference {
+    OwnerReference {
+        api_version: LuxGateway::api_version(&()).to_string(),
+        kind: LuxGateway::kind(&()).to_string(),
+        name: gateway.name_any(),
+        uid: gateway.metadata.uid.clone().unwrap_or_default(),
+        controller: Some(true),
+        block_owner_deletion: Some(true),
+    }
+}
+
+fn gateway_error_policy(
+    gateway: Arc<LuxGateway>,
+    error: &OperatorError,
+    _ctx: Arc<Context>,
+) -> Action {
+    error!(
+        "Error reconciling gateway {}: {:?}",
+        gateway.name_any(),
         error
     );
     Action::requeue(Duration::from_secs(30))
