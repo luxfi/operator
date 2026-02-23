@@ -3470,7 +3470,7 @@ async fn maybe_take_snapshot(
     let object_key = format!("{}/{}", prefix, archive_name);
     let endpoint = &schedule.object_store_endpoint;
     let access_key = schedule.access_key.as_deref().unwrap_or("hanzo");
-    let secret_key_ref = schedule.secret_key_ref.as_deref().unwrap_or("hanzo-minio-secret");
+    let secret_key_ref = schedule.secret_key_ref.as_deref().unwrap_or("hanzo-s3-secret");
     let snapshot_url = format!("{}/{}/{}", endpoint, bucket, object_key);
     let now_rfc3339 = chrono::Utc::now().to_rfc3339();
 
@@ -3488,20 +3488,20 @@ async fn maybe_take_snapshot(
         ));
     }
 
-    // The background script: tar + upload + cleanup + write done marker
+    // The background script: tar + upload via Hanzo s3 CLI + cleanup + write done marker
     let bg_script = format!(
         concat!(
             "echo $$ > {progress}; ",
             "{rlp_cmds}",
-            "tar czf {archive} -C /data --exclude='*.log' --exclude='LOCK' db chainData genesis.bytes 2>/dev/null; ",
-            "MC=/tmp/mc; ",
-            "if [ ! -f $MC ]; then ",
-            "  curl -sfL https://dl.min.io/client/mc/release/linux-amd64/mc -o $MC 2>/dev/null && chmod +x $MC; ",
-            "fi; ",
+            "tar czf {archive} -C /data --exclude='*.log' --exclude='LOCK' db chainData configs genesis.bytes plugins staking 2>/dev/null; ",
             "RESULT=FAIL; ",
-            "if [ -f $MC ]; then ",
-            "  $MC alias set snap {endpoint} {access_key} {secret_key} --api s3v4 2>/dev/null; ",
-            "  if $MC cp {archive} snap/{bucket}/{key} 2>/dev/null; then RESULT=OK; fi; ",
+            "export MC_CONFIG_DIR=/tmp/.mc; ",
+            "if [ ! -x /tmp/s3 ]; then ",
+            "  curl -sfL -o /tmp/s3 https://github.com/hanzos3/cli/releases/download/v0.1.0/s3-linux-amd64 && chmod +x /tmp/s3; ",
+            "fi; ",
+            "if /tmp/s3 alias set snap {endpoint} {access_key} {secret_key} >/dev/null 2>&1 && ",
+            "   /tmp/s3 cp {archive} snap/{bucket}/{key} >/dev/null 2>&1; then ",
+            "  RESULT=OK; ",
             "fi; ",
             "rm -f {archive} /tmp/*.rlp {progress}; ",
             "if [ \"$RESULT\" = \"OK\" ]; then ",
