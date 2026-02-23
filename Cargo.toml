@@ -33,7 +33,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # HTTP client
-reqwest = { version = "0.11", default-features = false, features = ["json", "native-tls"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 
 # HTTP server (health + metrics)
 axum = "0.7"
