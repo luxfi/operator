@@ -432,8 +432,8 @@ async fn reconcile_network(network: Arc<LuxNetwork>, ctx: Arc<Context>) -> Resul
                             .await
                             .map_err(OperatorError::KubeApi)?;
 
-                        // Also create per-pod LB services for new pods
-                        if network.spec.validators > current {
+                        // Also create per-pod services for new pods (only when enabled)
+                        if network.spec.service.per_pod_services && network.spec.validators > current {
                             create_per_pod_services(&network, &ctx).await?;
                         }
                     }
@@ -667,8 +667,10 @@ async fn create_network(network: &LuxNetwork, ctx: &Context) -> Result<LuxNetwor
     // Create ClusterIP/LoadBalancer Service for RPC access
     create_rpc_service(network, ctx).await?;
 
-    // Create per-pod LoadBalancer services for stable external IPs
-    create_per_pod_services(network, ctx).await?;
+    // Create per-pod services for stable external IPs (only when enabled)
+    if network.spec.service.per_pod_services {
+        create_per_pod_services(network, ctx).await?;
+    }
 
     // Create KMSSecret for staking keys (if KMS-backed)
     create_kms_secrets(network, ctx).await?;
@@ -900,7 +902,8 @@ fn generate_startup_script(network: &LuxNetwork) -> String {
         s.push_str("esac\n");
     }
 
-    // LB discovery via K8s API
+    // LB discovery via K8s API (only when per-pod services are enabled)
+    if spec.service.per_pod_services {
     s.push_str("\n# If no static IP, discover from per-pod LoadBalancer service\n");
     s.push_str("if [ -z \"$PUBLIC_IP\" ]; then\n");
     s.push_str("  SA_TOKEN_FILE=\"/var/run/secrets/kubernetes.io/serviceaccount/token\"\n");
@@ -937,6 +940,7 @@ fn generate_startup_script(network: &LuxNetwork) -> String {
     s.push_str("    done\n");
     s.push_str("  fi\n");
     s.push_str("fi\n\n");
+    } // end per_pod_services gate
 
     // Final fallback to pod IP
     s.push_str("if [ -z \"$PUBLIC_IP\" ]; then\n");
@@ -1166,6 +1170,24 @@ fn generate_startup_script(network: &LuxNetwork) -> String {
             }
         }
     }
+
+    // Copy staking keys from mounted secret to data dir
+    if spec.staking.is_some() {
+        s.push_str("# Copy staking keys for this pod\n");
+        s.push_str("IDX=${HOSTNAME##*-}\n");
+        s.push_str("mkdir -p /data/staking\n");
+        s.push_str("cp /staking-keys/staker-${IDX}.crt /data/staking/staker.crt\n");
+        s.push_str("cp /staking-keys/staker-${IDX}.key /data/staking/staker.key\n");
+        s.push_str("if [ -f \"/staking-keys/signer-${IDX}.key\" ]; then\n");
+        s.push_str("  cp /staking-keys/signer-${IDX}.key /data/staking/signer.key\n");
+        s.push_str("fi\n");
+        s.push_str("echo \"[STAKING] Copied staking keys for pod index ${IDX}\"\n\n");
+    }
+
+    // Copy plugins to PVC (ensures correct version on every restart)
+    s.push_str("# Copy plugins to PVC\n");
+    s.push_str("mkdir -p /data/plugins\n");
+    s.push_str("cp /luxd/build/plugins/* /data/plugins/ 2>/dev/null || true\n\n");
 
     // Start luxd in background
     s.push_str("# Start luxd in background\n");
@@ -1416,7 +1438,7 @@ async fn create_rpc_service(network: &LuxNetwork, ctx: &Context) -> Result<()> {
     apply_resource(&services, &name, &svc).await
 }
 
-/// Create per-pod LoadBalancer services for stable external IPs
+/// Create per-pod services for stable external IPs (type from CRD service_type)
 async fn create_per_pod_services(network: &LuxNetwork, ctx: &Context) -> Result<()> {
     let name = network.name_any();
     let namespace = network.namespace().unwrap_or_else(|| "default".to_string());
@@ -1469,7 +1491,7 @@ async fn create_per_pod_services(network: &LuxNetwork, ctx: &Context) -> Result<
                 ..Default::default()
             },
             spec: Some(K8sServiceSpec {
-                type_: Some("LoadBalancer".to_string()),
+                type_: Some(spec.service.service_type.clone()),
                 selector: Some(selector),
                 ports: Some(vec![
                     ServicePort {
@@ -1494,8 +1516,8 @@ async fn create_per_pod_services(network: &LuxNetwork, ctx: &Context) -> Result<
     }
 
     info!(
-        "Created {} per-pod LoadBalancer services for {}",
-        spec.validators, name
+        "Created {} per-pod {} services for {}",
+        spec.validators, spec.service.service_type, name
     );
     Ok(())
 }
@@ -3601,6 +3623,7 @@ async fn exec_in_pod(
             pod_name,
             cmd,
             &kube::api::AttachParams::default()
+                .container("luxd")
                 .stdout(true)
                 .stderr(true),
         )
@@ -3719,7 +3742,7 @@ fn build_resource_requirements(spec: &crate::crd::ResourceSpec) -> ResourceRequi
     }
 }
 
-/// Apply a Kubernetes resource (create or update via server-side apply)
+/// Apply a Kubernetes resource via server-side apply (idempotent create or update)
 async fn apply_resource<T>(api: &Api<T>, name: &str, resource: &T) -> Result<()>
 where
     T: kube::Resource<DynamicType = ()>
@@ -3735,6 +3758,7 @@ where
         .map_err(OperatorError::KubeApi)?;
     Ok(())
 }
+
 
 /// Error policy for the network controller
 fn network_error_policy(
@@ -4752,7 +4776,7 @@ async fn create_gateway_resources(
     let deploy_api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
     apply_resource(&deploy_api, &deploy_name, &deployment).await?;
 
-    // LoadBalancer Service
+    // Gateway Service (type from CRD, default ClusterIP)
     let svc_name = format!("{}-gateway", name);
     let svc = Service {
         metadata: kube::core::ObjectMeta {
@@ -4770,7 +4794,7 @@ async fn create_gateway_resources(
                 target_port: Some(IntOrString::Int(spec.port)),
                 ..Default::default()
             }]),
-            type_: Some("LoadBalancer".to_string()),
+            type_: Some(spec.service_type.clone()),
             ..Default::default()
         }),
         ..Default::default()
@@ -5010,3 +5034,4 @@ fn gateway_error_policy(
     );
     Action::requeue(Duration::from_secs(30))
 }
+

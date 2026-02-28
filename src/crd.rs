@@ -377,7 +377,7 @@ impl Default for StartupGateSpec {
 }
 
 fn default_on_timeout() -> String {
-    "Fail".to_string()
+    "StartAnyway".to_string()
 }
 
 fn default_min_peers() -> u32 {
@@ -683,7 +683,7 @@ fn default_uid() -> i64 {
 }
 
 /// Image configuration
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageSpec {
     /// Image repository
@@ -703,6 +703,17 @@ pub struct ImageSpec {
     pub pull_secrets: Vec<String>,
 }
 
+impl Default for ImageSpec {
+    fn default() -> Self {
+        Self {
+            repository: default_image_repo(),
+            tag: default_image_tag(),
+            pull_policy: default_pull_policy(),
+            pull_secrets: Vec::new(),
+        }
+    }
+}
+
 fn default_image_repo() -> String {
     "ghcr.io/luxfi/node".to_string()
 }
@@ -716,7 +727,7 @@ fn default_pull_policy() -> String {
 }
 
 /// Storage configuration
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageSpec {
     /// Storage class name
@@ -726,6 +737,15 @@ pub struct StorageSpec {
     /// Storage size
     #[serde(default = "default_storage_size")]
     pub size: String,
+}
+
+impl Default for StorageSpec {
+    fn default() -> Self {
+        Self {
+            storage_class: None,
+            size: default_storage_size(),
+        }
+    }
 }
 
 fn default_storage_size() -> String {
@@ -825,6 +845,10 @@ pub struct ServiceSpec {
     /// Ingress host
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ingress_host: Option<String>,
+
+    /// Create per-pod services (one service per validator pod for stable IPs)
+    #[serde(default)]
+    pub per_pod_services: bool,
 }
 
 fn default_service_type() -> String {
@@ -1623,6 +1647,10 @@ pub struct LuxGatewaySpec {
     /// Explorer references for UI routing
     #[serde(default)]
     pub explorer_refs: Vec<String>,
+
+    /// Service type for the gateway service (default: ClusterIP)
+    #[serde(default = "default_service_type")]
+    pub service_type: String,
 }
 
 /// Gateway image configuration

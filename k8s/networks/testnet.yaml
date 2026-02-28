@@ -7,6 +7,10 @@ spec:
   networkId: 2
   validators: 5
   adoptExisting: true
+  genesisConfigMap: luxd-genesis
+
+  image:
+    tag: v1.23.23
 
   ports:
     http: 9640
@@ -27,24 +31,28 @@ spec:
         credentialsSecret: universal-auth-credentials
         credentialsNamespace: lux-system
 
-  # Seed restore from MinIO snapshot
+  # Seed restore from Hanzo S3 snapshot
   seedRestore:
     enabled: true
     sourceType: ObjectStore
-    objectStoreUrl: "http://minio.hanzo.svc.cluster.local:9000/lux-snapshots/testnet/testnet-node0-full.tar.gz"
+    objectStoreUrl: "http://s3.hanzo.svc.cluster.local:9000/lux-snapshots/testnet/testnet-node0-full.tar.gz"
 
-  # Automated snapshot schedule (hourly to MinIO)
+  # Automated snapshot schedule (hourly to Hanzo S3)
   snapshotSchedule:
     enabled: true
     intervalSeconds: 3600
-    objectStoreEndpoint: "http://minio.hanzo.svc.cluster.local:9000"
+    objectStoreEndpoint: "http://s3.hanzo.svc.cluster.local:9000"
     bucket: lux-snapshots
     prefix: testnet
     accessKey: hanzo
-    secretKeyRef: hanzo-minio-secret
+    secretKeyRef: hanzo-s3-secret
     sourceNodeIndex: 0
     includeRlpExports: true
     maxRetained: 5
+
+  startupGate:
+    onTimeout: StartAnyway
+    timeoutSeconds: 30
 
   chainTracking:
     trackAllChains: true
