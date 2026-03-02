@@ -113,11 +113,13 @@ async fn main() -> anyhow::Result<()> {
     let indexer_client = client.clone();
     let explorer_client = client.clone();
     let gateway_client = client.clone();
+    let mpc_client = client.clone();
     let network_ns = args.namespace.clone();
     let chain_ns = args.namespace.clone();
     let indexer_ns = args.namespace.clone();
     let explorer_ns = args.namespace.clone();
     let gateway_ns = args.namespace.clone();
+    let mpc_ns = args.namespace.clone();
     let mpc_endpoint = args.mpc_endpoint.clone();
 
     tokio::select! {
@@ -144,6 +146,11 @@ async fn main() -> anyhow::Result<()> {
         res = controller::run_gateway_controller(gateway_client, gateway_ns) => {
             if let Err(e) = res {
                 tracing::error!("Gateway controller exited with error: {:?}", e);
+            }
+        }
+        res = controller::run_mpc_controller(mpc_client, mpc_ns) => {
+            if let Err(e) = res {
+                tracing::error!("MPC controller exited with error: {:?}", e);
             }
         }
         res = axum::serve(

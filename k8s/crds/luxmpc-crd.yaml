@@ -1,0 +1,54 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: luxmpcs.lux.network
+spec:
+  group: lux.network
+  scope: Namespaced
+  names:
+    plural: luxmpcs
+    singular: luxmpc
+    kind: LuxMPC
+    shortNames:
+      - luxmpc
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Ready
+          type: string
+          jsonPath: .status.readyNodes
+        - name: Threshold
+          type: string
+          jsonPath: .spec.threshold
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: >
+            LuxMPC manages a self-hosted MPC threshold signing cluster.
+            Deploys N MPC nodes with CGGMP21 + FROST threshold signing.
+            Exposes a REST API for vault/wallet management and bridge signing.
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+              description: LuxMPC spec controls the MPC cluster configuration.
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+              description: LuxMPC status reflects current cluster state.

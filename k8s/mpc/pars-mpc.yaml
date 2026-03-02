@@ -1,0 +1,50 @@
+---
+# Pars MPC cluster: 3 nodes, 2-of-3 threshold, hosted at mpc.pars.network
+apiVersion: lux.network/v1alpha1
+kind: LuxMPC
+metadata:
+  name: pars-mpc
+  namespace: pars-mpc
+spec:
+  nodes: 3
+  threshold: 2
+  image: ghcr.io/luxfi/mpc-api:latest
+  imagePullPolicy: Always
+
+  # Ports
+  p2pPort: 9651
+  apiPort: 8081
+
+  # Storage per node (BadgerDB key shares)
+  storage: 10Gi
+
+  # Secret name (must be pre-created with DB/KV/JWT creds)
+  secretName: mpc-secrets
+
+  # Embedded infrastructure
+  deployPostgres: true
+  deployValkey: true
+
+  # Public hostname for ingress
+  hostname: mpc.pars.network
+  tlsSecret: mpc-pars-network-tls
+  clusterIssuer: letsencrypt-prod
+
+  # Dashboard
+  dashboardImage: ghcr.io/luxfi/mpc-dashboard:latest
+  dashboardApiUrl: https://mpc.pars.network/api/v1
+  iamUrl: https://lux.id
+  iamClientId: pars-mpc
+
+  # Resources
+  cpuRequest: "200m"
+  memoryRequest: "512Mi"
+  cpuLimit: "1000m"
+  memoryLimit: "1Gi"
+
+  # S3 backup (configure after initial setup)
+  # backup:
+  #   bucket: pars-mpc-backups
+  #   region: us-east-1
+  #   credentialsSecret: pars-s3-credentials
+  #   intervalSeconds: 300

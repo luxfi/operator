@@ -1,0 +1,35 @@
+---
+# Lux Bridge MPC cluster: 3 nodes, 2-of-3 threshold, hosted at mpc.lux.network
+# This CR describes the existing manually-deployed cluster — operator will adopt it.
+apiVersion: lux.network/v1alpha1
+kind: LuxMPC
+metadata:
+  name: lux-mpc
+  namespace: lux-mpc
+spec:
+  nodes: 3
+  threshold: 2
+  image: ghcr.io/luxfi/mpc-api:latest
+  imagePullPolicy: Always
+
+  p2pPort: 9651
+  apiPort: 8081
+  storage: 10Gi
+  secretName: mpc-secrets
+
+  deployPostgres: true
+  deployValkey: true
+
+  hostname: mpc.lux.network
+  tlsSecret: mpc-lux-network-tls
+  clusterIssuer: letsencrypt-prod
+
+  dashboardImage: ghcr.io/luxfi/mpc-dashboard:latest
+  dashboardApiUrl: https://mpc.lux.network/api/v1
+  iamUrl: https://lux.id
+  iamClientId: lux-mpc
+
+  cpuRequest: "200m"
+  memoryRequest: "512Mi"
+  cpuLimit: "1000m"
+  memoryLimit: "1Gi"

@@ -1904,3 +1904,200 @@ pub struct LuxChainStatus {
     #[schemars(skip)]
     pub conditions: Vec<Condition>,
 }
+
+// ───────────────────────── LuxMPC CRD ─────────────────────────
+
+/// LuxMPC manages a self-hosted MPC (Multi-Party Computation) signing cluster.
+/// Deploys N MPC nodes with threshold t-of-n signing using CGGMP21 + FROST.
+/// Exposes a REST API for vault/wallet management and bridge signing.
+#[derive(CustomResource, Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[kube(
+    group = "lux.network",
+    version = "v1alpha1",
+    kind = "LuxMPC",
+    namespaced,
+    status = "LuxMPCStatus",
+    shortname = "luxmpc",
+    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
+    printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.readyNodes"}"#,
+    printcolumn = r#"{"name":"Threshold","type":"string","jsonPath":".spec.threshold"}"#,
+    printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
+)]
+#[serde(rename_all = "camelCase")]
+pub struct LuxMPCSpec {
+    /// Number of MPC nodes (replicas in StatefulSet)
+    #[serde(default = "default_mpc_nodes")]
+    pub nodes: u32,
+
+    /// Signing threshold (minimum nodes required to sign)
+    #[serde(default = "default_mpc_threshold")]
+    pub threshold: u32,
+
+    /// MPC node image (defaults to ghcr.io/luxfi/mpc-api:latest)
+    #[serde(default = "default_mpc_image")]
+    pub image: String,
+
+    /// Image pull policy
+    #[serde(default = "default_pull_policy")]
+    pub image_pull_policy: String,
+
+    /// P2P listen port for MPC consensus transport
+    #[serde(default = "default_mpc_p2p_port")]
+    pub p2p_port: u32,
+
+    /// API listen port for REST API
+    #[serde(default = "default_mpc_api_port")]
+    pub api_port: u32,
+
+    /// Storage per MPC node (BadgerDB key shares)
+    #[serde(default = "default_mpc_storage")]
+    pub storage: String,
+
+    /// Storage class name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_class: Option<String>,
+
+    /// Secret containing: postgres-password, jwt-secret, DATABASE_URL, KV_URL, mpc-password
+    #[serde(default = "default_mpc_secret")]
+    pub secret_name: String,
+
+    /// PostgreSQL DSN (overrides secret DATABASE_URL)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_url: Option<String>,
+
+    /// Valkey/Redis URL for session state (overrides secret KV_URL)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_url: Option<String>,
+
+    /// Deploy embedded PostgreSQL StatefulSet (set false to use external DB)
+    #[serde(default = "default_true_bool")]
+    pub deploy_postgres: bool,
+
+    /// Deploy embedded Valkey StatefulSet (set false to use external Valkey)
+    #[serde(default = "default_true_bool")]
+    pub deploy_valkey: bool,
+
+    /// API hostname for Ingress (e.g. mpc.pars.network)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+
+    /// TLS secret name for Ingress (cert-manager will populate this)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_secret: Option<String>,
+
+    /// cert-manager ClusterIssuer name for TLS
+    #[serde(default = "default_cluster_issuer")]
+    pub cluster_issuer: String,
+
+    /// CPU request
+    #[serde(default = "default_mpc_cpu_req")]
+    pub cpu_request: String,
+
+    /// Memory request
+    #[serde(default = "default_mpc_mem_req")]
+    pub memory_request: String,
+
+    /// CPU limit
+    #[serde(default = "default_mpc_cpu_lim")]
+    pub cpu_limit: String,
+
+    /// Memory limit
+    #[serde(default = "default_mpc_mem_lim")]
+    pub memory_limit: String,
+
+    /// S3 backup configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup: Option<MpcBackupSpec>,
+
+    /// Dashboard frontend image (ghcr.io/luxfi/mpc-dashboard:latest)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dashboard_image: Option<String>,
+
+    /// Dashboard API URL baked into the frontend build
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dashboard_api_url: Option<String>,
+
+    /// IAM (lux.id) base URL for OIDC login
+    #[serde(default = "default_iam_url")]
+    pub iam_url: String,
+
+    /// IAM OAuth client ID
+    #[serde(default = "default_iam_client_id")]
+    pub iam_client_id: String,
+}
+
+fn default_mpc_nodes() -> u32 { 3 }
+fn default_mpc_threshold() -> u32 { 2 }
+fn default_mpc_image() -> String { "ghcr.io/luxfi/mpc-api:latest".to_string() }
+fn default_mpc_p2p_port() -> u32 { 9651 }
+fn default_mpc_api_port() -> u32 { 8081 }
+fn default_mpc_storage() -> String { "10Gi".to_string() }
+fn default_mpc_secret() -> String { "mpc-secrets".to_string() }
+fn default_true_bool() -> bool { true }
+fn default_cluster_issuer() -> String { "letsencrypt-prod".to_string() }
+fn default_mpc_cpu_req() -> String { "200m".to_string() }
+fn default_mpc_mem_req() -> String { "512Mi".to_string() }
+fn default_mpc_cpu_lim() -> String { "1000m".to_string() }
+fn default_mpc_mem_lim() -> String { "1Gi".to_string() }
+fn default_iam_url() -> String { "https://lux.id".to_string() }
+fn default_iam_client_id() -> String { "lux-mpc".to_string() }
+
+/// S3 backup configuration for MPC key shares
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MpcBackupSpec {
+    /// S3 bucket name
+    pub bucket: String,
+
+    /// S3 endpoint (empty = AWS S3)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+
+    /// S3 region
+    #[serde(default = "default_s3_region")]
+    pub region: String,
+
+    /// Secret with AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+    pub credentials_secret: String,
+
+    /// Backup interval in seconds
+    #[serde(default = "default_backup_interval")]
+    pub interval_seconds: u32,
+}
+
+fn default_s3_region() -> String { "us-east-1".to_string() }
+fn default_backup_interval() -> u32 { 300 }
+
+/// Status of a LuxMPC cluster
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LuxMPCStatus {
+    /// Current phase: Pending, Provisioning, Ready, Degraded, Error
+    #[serde(default)]
+    pub phase: String,
+
+    /// Number of ready MPC nodes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_nodes: Option<u32>,
+
+    /// Total expected MPC nodes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_nodes: Option<u32>,
+
+    /// API endpoint URL (cluster-internal)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_endpoint: Option<String>,
+
+    /// Public hostname (if ingress configured)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+
+    /// Last reconcile time
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_reconcile: Option<String>,
+
+    /// Conditions
+    #[serde(default)]
+    #[schemars(skip)]
+    pub conditions: Vec<Condition>,
+}

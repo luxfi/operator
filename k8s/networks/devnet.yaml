@@ -35,13 +35,13 @@ spec:
   seedRestore:
     enabled: true
     sourceType: ObjectStore
-    objectStoreUrl: "http://s3.hanzo.svc.cluster.local:9000/lux-snapshots/devnet/devnet-node0-full.tar.gz"
+    objectStoreUrl: "https://s3.lux.network/lux-snapshots/devnet/devnet-node0-full.tar.gz"
 
-  # Automated snapshot schedule (hourly to Hanzo S3)
+  # Automated snapshot schedule (hourly to Hanzo S3 via s3.lux.network)
   snapshotSchedule:
     enabled: true
     intervalSeconds: 3600
-    objectStoreEndpoint: "http://s3.hanzo.svc.cluster.local:9000"
+    objectStoreEndpoint: "https://s3.lux.network"
     bucket: lux-snapshots
     prefix: devnet
     accessKey: hanzo

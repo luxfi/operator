@@ -3,12 +3,12 @@ kind: ClusterRole
 metadata:
   name: lux-operator
 rules:
-  # CRDs: LuxNetwork / LuxChain / LuxIndexer / LuxExplorer / LuxGateway
+  # CRDs: LuxNetwork / LuxChain / LuxIndexer / LuxExplorer / LuxGateway / LuxMPC
   - apiGroups: ["lux.network"]
-    resources: ["luxnetworks", "luxchains", "luxindexers", "luxexplorers", "luxgateways"]
+    resources: ["luxnetworks", "luxchains", "luxindexers", "luxexplorers", "luxgateways", "luxmpcs"]
     verbs: ["get", "list", "watch", "patch", "update"]
   - apiGroups: ["lux.network"]
-    resources: ["luxnetworks/status", "luxchains/status", "luxindexers/status", "luxexplorers/status", "luxgateways/status"]
+    resources: ["luxnetworks/status", "luxchains/status", "luxindexers/status", "luxexplorers/status", "luxgateways/status", "luxmpcs/status"]
     verbs: ["get", "patch", "update"]
 
   # Core resources
@@ -45,6 +45,11 @@ rules:
   # KMS: KMSSecret resources for staking key sync
   - apiGroups: ["secrets.lux.network"]
     resources: ["kmssecrets"]
+    verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]
+
+  # PersistentVolumeClaims (MPC node key share storage)
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
     verbs: ["create", "get", "list", "watch", "patch", "update", "delete"]
 
   # Events

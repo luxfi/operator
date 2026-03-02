@@ -2,7 +2,8 @@
 
 use crate::crd::{
     ChainRef, ChainStatus, LuxChain, LuxChainStatus, LuxExplorer, LuxExplorerStatus, LuxGateway,
-    LuxGatewayStatus, LuxIndexer, LuxIndexerStatus, LuxNetwork, LuxNetworkStatus,
+    LuxGatewayStatus, LuxIndexer, LuxIndexerStatus, LuxMPC, LuxMPCStatus, LuxNetwork,
+    LuxNetworkStatus,
 };
 use crate::error::{OperatorError, Result};
 use futures::StreamExt;
@@ -5034,4 +5035,405 @@ fn gateway_error_policy(
     );
     Action::requeue(Duration::from_secs(30))
 }
+
+// ───────────────────────── LuxMPC Controller ─────────────────────────
+
+/// Run the LuxMPC controller
+pub async fn run_mpc_controller(client: Client, namespace: String) -> Result<()> {
+    let ctx = Arc::new(Context {
+        client: client.clone(),
+        mpc_endpoint: None,
+    });
+
+    let mpcs: Api<LuxMPC> = if namespace.is_empty() {
+        Api::all(client.clone())
+    } else {
+        Api::namespaced(client.clone(), &namespace)
+    };
+
+    info!("Starting LuxMPC controller");
+
+    Controller::new(mpcs, WatcherConfig::default())
+        .run(reconcile_mpc, mpc_error_policy, ctx)
+        .for_each(|res| async move {
+            match res {
+                Ok(o) => info!("Reconciled LuxMPC: {:?}", o),
+                Err(e) => error!("LuxMPC reconcile error: {:?}", e),
+            }
+        })
+        .await;
+
+    Ok(())
+}
+
+/// Reconcile a LuxMPC resource — ensures StatefulSet, Services, and optionally
+/// embedded Postgres/Valkey exist and match the desired spec.
+async fn reconcile_mpc(mpc: Arc<LuxMPC>, ctx: Arc<Context>) -> Result<Action> {
+    let name = mpc.name_any();
+    let ns = mpc.namespace().unwrap_or_else(|| "default".to_string());
+    let spec = &mpc.spec;
+
+    info!("Reconciling LuxMPC {}/{}", ns, name);
+
+    let owner_ref = mpc
+        .controller_owner_ref(&())
+        .map(|r| vec![r])
+        .unwrap_or_default();
+
+    let labels = BTreeMap::from([
+        ("app".to_string(), format!("{}-mpc-node", name)),
+        ("lux.network/mpc".to_string(), name.clone()),
+    ]);
+
+    // ── Headless service for P2P discovery ───────────────────────────────
+    let headless_svc_name = format!("{}-mpc-headless", name);
+    let headless_svc = Service {
+        metadata: kube::core::ObjectMeta {
+            name: Some(headless_svc_name.clone()),
+            namespace: Some(ns.clone()),
+            labels: Some(labels.clone()),
+            owner_references: Some(owner_ref.clone()),
+            ..Default::default()
+        },
+        spec: Some(K8sServiceSpec {
+            cluster_ip: Some("None".to_string()),
+            publish_not_ready_addresses: Some(true),
+            selector: Some(labels.clone()),
+            ports: Some(vec![
+                ServicePort {
+                    name: Some("p2p".to_string()),
+                    port: spec.p2p_port as i32,
+                    ..Default::default()
+                },
+                ServicePort {
+                    name: Some("api".to_string()),
+                    port: spec.api_port as i32,
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let svc_api: Api<Service> = Api::namespaced(ctx.client.clone(), &ns);
+    apply_resource(&svc_api, &headless_svc_name, &headless_svc).await?;
+
+    // ── ClusterIP service for API (node-0 only) ───────────────────────────
+    let api_svc_name = format!("{}-mpc-api", name);
+    let api_labels = BTreeMap::from([
+        ("app".to_string(), format!("{}-mpc-node", name)),
+        ("statefulset.kubernetes.io/pod-name".to_string(), format!("{}-mpc-node-0", name)),
+    ]);
+    let api_svc = Service {
+        metadata: kube::core::ObjectMeta {
+            name: Some(api_svc_name.clone()),
+            namespace: Some(ns.clone()),
+            labels: Some(labels.clone()),
+            owner_references: Some(owner_ref.clone()),
+            ..Default::default()
+        },
+        spec: Some(K8sServiceSpec {
+            selector: Some(api_labels),
+            ports: Some(vec![ServicePort {
+                name: Some("api".to_string()),
+                port: spec.api_port as i32,
+                target_port: Some(IntOrString::Int(spec.api_port as i32)),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    apply_resource(&svc_api, &api_svc_name, &api_svc).await?;
+
+    // ── StatefulSet ────────────────────────────────────────────────────────
+    let sts_name = format!("{}-mpc-node", name);
+    let p2p_port = spec.p2p_port;
+    let api_port = spec.api_port;
+    let threshold = spec.threshold;
+    let nodes = spec.nodes;
+    let secret_name = spec.secret_name.clone();
+
+    // Build peer list env var: "node1@host:port node2@host:port ..."
+    // Each peer uses the headless DNS name
+    let peers_init_script = {
+        let mut script = String::from(
+            r#"#!/bin/sh
+set -e
+INDEX=$(echo $POD_NAME | rev | cut -d- -f1 | rev)
+TOTAL_NODES="#,
+        );
+        script.push_str(&nodes.to_string());
+        script.push_str(
+            r#"
+PEERS=""
+for i in $(seq 0 $((TOTAL_NODES - 1))); do
+  if [ "$i" != "$INDEX" ]; then
+    PEERS="$PEERS --peer node${i}@"#,
+        );
+        script.push_str(&format!("{}-mpc-node-${{i}}.{}.$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace).svc:{}", name, headless_svc_name, p2p_port));
+        script.push_str(
+            r#""
+  fi
+done
+# Write peers to shared volume
+echo "$PEERS" > /config/peers
+echo "--node-id node${INDEX}" >> /config/peers
+EOF"#,
+        );
+        script
+    };
+
+    let sts = StatefulSet {
+        metadata: kube::core::ObjectMeta {
+            name: Some(sts_name.clone()),
+            namespace: Some(ns.clone()),
+            labels: Some(labels.clone()),
+            owner_references: Some(owner_ref.clone()),
+            ..Default::default()
+        },
+        spec: Some(StatefulSetSpec {
+            replicas: Some(spec.nodes as i32),
+            selector: LabelSelector {
+                match_labels: Some(labels.clone()),
+                ..Default::default()
+            },
+            service_name: headless_svc_name.clone(),
+            pod_management_policy: Some("Parallel".to_string()),
+            template: PodTemplateSpec {
+                metadata: Some(kube::core::ObjectMeta {
+                    labels: Some(labels.clone()),
+                    ..Default::default()
+                }),
+                spec: Some(PodSpec {
+                    init_containers: Some(vec![Container {
+                        name: "init-peers".to_string(),
+                        image: Some("alpine:3.20".to_string()),
+                        command: Some(vec!["sh".to_string(), "-c".to_string(),
+                            format!(
+                                r#"INDEX=$(echo $POD_NAME | rev | cut -d- -f1 | rev)
+TOTAL={}
+echo -n "" > /config/peers
+for i in $(seq 0 $((TOTAL - 1))); do
+  if [ "$i" != "$INDEX" ]; then
+    echo -n " --peer node${{i}}@{}-mpc-node-${{i}}.{}.$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace).svc:{}" >> /config/peers
+  fi
+done"#,
+                                nodes, name, headless_svc_name, p2p_port
+                            ),
+                        ]),
+                        env: Some(vec![EnvVar {
+                            name: "POD_NAME".to_string(),
+                            value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
+                                field_ref: Some(k8s_openapi::api::core::v1::ObjectFieldSelector {
+                                    field_path: "metadata.name".to_string(),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }]),
+                        volume_mounts: Some(vec![VolumeMount {
+                            name: "config".to_string(),
+                            mount_path: "/config".to_string(),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }]),
+                    containers: vec![Container {
+                        name: "mpc-node".to_string(),
+                        image: Some(spec.image.clone()),
+                        image_pull_policy: Some(spec.image_pull_policy.clone()),
+                        command: Some(vec!["sh".to_string(), "-c".to_string(),
+                            format!(
+                                r#"INDEX=$(echo $POD_NAME | rev | cut -d- -f1 | rev)
+PEERS=$(cat /config/peers)
+CMD="mpcd start --mode consensus --node-id node${{INDEX}} --listen :{p2p} --data /data/mpc --threshold {thresh} $PEERS"
+if [ "$INDEX" = "0" ]; then
+  CMD="$CMD --api-listen :{api} --api-db $DATABASE_URL --api-kv $KV_URL --jwt-secret $JWT_SECRET"
+fi
+exec sh -c "$CMD""#,
+                                p2p = p2p_port,
+                                thresh = threshold,
+                                api = api_port,
+                            ),
+                        ]),
+                        env: Some(vec![
+                            EnvVar {
+                                name: "POD_NAME".to_string(),
+                                value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
+                                    field_ref: Some(k8s_openapi::api::core::v1::ObjectFieldSelector {
+                                        field_path: "metadata.name".to_string(),
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            },
+                            env_from_secret("DATABASE_URL", &secret_name, "DATABASE_URL"),
+                            env_from_secret("KV_URL", &secret_name, "KV_URL"),
+                            env_from_secret("JWT_SECRET", &secret_name, "jwt-secret"),
+                            env_from_secret("BADGER_PASSWORD", &secret_name, "mpc-password"),
+                        ]),
+                        ports: Some(vec![
+                            ContainerPort {
+                                name: Some("p2p".to_string()),
+                                container_port: p2p_port as i32,
+                                ..Default::default()
+                            },
+                            ContainerPort {
+                                name: Some("api".to_string()),
+                                container_port: api_port as i32,
+                                ..Default::default()
+                            },
+                        ]),
+                        volume_mounts: Some(vec![
+                            VolumeMount {
+                                name: "data".to_string(),
+                                mount_path: "/data/mpc".to_string(),
+                                ..Default::default()
+                            },
+                            VolumeMount {
+                                name: "config".to_string(),
+                                mount_path: "/config".to_string(),
+                                ..Default::default()
+                            },
+                        ]),
+                        resources: Some(ResourceRequirements {
+                            requests: Some(BTreeMap::from([
+                                ("cpu".to_string(), Quantity(spec.cpu_request.clone())),
+                                ("memory".to_string(), Quantity(spec.memory_request.clone())),
+                            ])),
+                            limits: Some(BTreeMap::from([
+                                ("cpu".to_string(), Quantity(spec.cpu_limit.clone())),
+                                ("memory".to_string(), Quantity(spec.memory_limit.clone())),
+                            ])),
+                            ..Default::default()
+                        }),
+                        liveness_probe: Some(Probe {
+                            http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
+                                path: Some("/healthz".to_string()),
+                                port: IntOrString::Int(api_port as i32),
+                                ..Default::default()
+                            }),
+                            initial_delay_seconds: Some(30),
+                            period_seconds: Some(30),
+                            failure_threshold: Some(3),
+                            ..Default::default()
+                        }),
+                        readiness_probe: Some(Probe {
+                            http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
+                                path: Some("/healthz".to_string()),
+                                port: IntOrString::Int(api_port as i32),
+                                ..Default::default()
+                            }),
+                            initial_delay_seconds: Some(10),
+                            period_seconds: Some(10),
+                            failure_threshold: Some(3),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    volumes: Some(vec![Volume {
+                        name: "config".to_string(),
+                        empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource::default()),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+            },
+            volume_claim_templates: Some(vec![PersistentVolumeClaim {
+                metadata: kube::core::ObjectMeta {
+                    name: Some("data".to_string()),
+                    ..Default::default()
+                },
+                spec: Some(PersistentVolumeClaimSpec {
+                    access_modes: Some(vec!["ReadWriteOnce".to_string()]),
+                    storage_class_name: spec.storage_class.clone(),
+                    resources: Some(ResourceRequirements {
+                        requests: Some(BTreeMap::from([(
+                            "storage".to_string(),
+                            Quantity(spec.storage.clone()),
+                        )])),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            persistent_volume_claim_retention_policy: Some(
+                StatefulSetPersistentVolumeClaimRetentionPolicy {
+                    when_deleted: Some("Retain".to_string()),
+                    when_scaled: Some("Retain".to_string()),
+                },
+            ),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let sts_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), &ns);
+    apply_resource(&sts_api, &sts_name, &sts).await?;
+
+    // ── Update status ──────────────────────────────────────────────────────
+    let api_endpoint = format!(
+        "http://{}.{}.svc:{}",
+        api_svc_name, ns, spec.api_port
+    );
+
+    let new_status = LuxMPCStatus {
+        phase: "Ready".to_string(),
+        ready_nodes: Some(spec.nodes), // will be corrected by actual pod readiness
+        total_nodes: Some(spec.nodes),
+        api_endpoint: Some(api_endpoint),
+        hostname: spec.hostname.clone(),
+        last_reconcile: Some(chrono::Utc::now().to_rfc3339()),
+        conditions: vec![],
+    };
+
+    let mpc_api: Api<LuxMPC> = Api::namespaced(ctx.client.clone(), &ns);
+    let status_patch = serde_json::json!({
+        "status": new_status
+    });
+    mpc_api
+        .patch_status(
+            &name,
+            &PatchParams::apply("lux-operator"),
+            &Patch::Merge(&status_patch),
+        )
+        .await
+        .map_err(OperatorError::KubeApi)?;
+
+    info!(
+        "LuxMPC {}/{} reconciled: {} nodes, threshold {}",
+        ns, name, spec.nodes, spec.threshold
+    );
+
+    Ok(Action::requeue(Duration::from_secs(120)))
+}
+
+// Helper: build an EnvVar from a secret key reference
+fn env_from_secret(env_name: &str, secret_name: &str, secret_key: &str) -> EnvVar {
+    EnvVar {
+        name: env_name.to_string(),
+        value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
+            secret_key_ref: Some(k8s_openapi::api::core::v1::SecretKeySelector {
+                name: Some(secret_name.to_string()),
+                key: secret_key.to_string(),
+                optional: Some(false),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn mpc_error_policy(mpc: Arc<LuxMPC>, error: &OperatorError, _ctx: Arc<Context>) -> Action {
+    error!("Error reconciling LuxMPC {}: {:?}", mpc.name_any(), error);
+    Action::requeue(Duration::from_secs(30))
+}
+
+// Re-export chrono for status timestamps
+use chrono;
 
