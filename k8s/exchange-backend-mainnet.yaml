@@ -1,0 +1,606 @@
+# Exchange Backend Infrastructure
+# Namespace: lux-explorer
+# Components: graph-postgres, graph-ipfs, graph-node, exchange-api, dex-gateway
+# Subgraphs: luxfi/uniswap-v2, luxfi/uniswap-v3 (deployed separately via graph CLI)
+---
+# PVC for graph-postgres
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: graph-postgres-data
+  namespace: lux-explorer
+  labels:
+    app: graph-postgres
+    component: exchange-backend
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: do-block-storage
+  resources:
+    requests:
+      storage: 20Gi
+---
+# Graph Postgres — stores all subgraph indexed data
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: graph-postgres
+  namespace: lux-explorer
+  labels:
+    app: graph-postgres
+    component: exchange-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: graph-postgres
+  serviceName: graph-postgres
+  template:
+    metadata:
+      labels:
+        app: graph-postgres
+        component: exchange-backend
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: "graph"
+            - name: POSTGRES_PASSWORD
+              value: "graph-lux-2026"
+            - name: POSTGRES_DB
+              value: "graph_node"
+            - name: POSTGRES_INITDB_ARGS
+              value: "-E UTF8 --locale=C"
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          volumeMounts:
+            - mountPath: /var/lib/postgresql/data
+              name: data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "graph", "-d", "graph_node"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "graph", "-d", "graph_node"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: graph-postgres-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: graph-postgres
+  namespace: lux-explorer
+  labels:
+    app: graph-postgres
+    component: exchange-backend
+spec:
+  selector:
+    app: graph-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+      protocol: TCP
+  type: ClusterIP
+---
+# PVC for graph-ipfs — persistent WASM artifacts survive pod restarts
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: graph-ipfs-data
+  namespace: lux-explorer
+  labels:
+    app: graph-ipfs
+    component: exchange-backend
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: do-block-storage
+  resources:
+    requests:
+      storage: 5Gi
+---
+# Graph IPFS — stores subgraph WASM + schema artifacts
+# Uses PVC so subgraphs survive pod restarts (no need to redeploy)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: graph-ipfs
+  namespace: lux-explorer
+  labels:
+    app: graph-ipfs
+    component: exchange-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: graph-ipfs
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: graph-ipfs
+        component: exchange-backend
+    spec:
+      containers:
+        - name: ipfs
+          image: ipfs/kubo:v0.28.0
+          ports:
+            - containerPort: 5001
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+          volumeMounts:
+            - mountPath: /data/ipfs
+              name: data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: graph-ipfs-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: graph-ipfs
+  namespace: lux-explorer
+  labels:
+    app: graph-ipfs
+    component: exchange-backend
+spec:
+  selector:
+    app: graph-ipfs
+  ports:
+    - name: api
+      port: 5001
+      targetPort: 5001
+      protocol: TCP
+    - name: gateway
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP
+---
+# Graph Node ConfigMap — TOML config for graph-node
+# node_id MUST use underscore (graph_node) — graph-node normalizes hyphens internally
+# features = ["archive"] required even though luxd isn't an archive node
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: graph-node-config
+  namespace: lux-explorer
+  labels:
+    app: graph-node
+    component: exchange-backend
+data:
+  config.toml: |
+    [store]
+    [store.primary]
+    connection = "postgresql://graph:graph-lux-2026@graph-postgres.lux-explorer.svc:5432/graph_node?sslmode=disable"
+    weight = 1
+    pool_size = 10
+
+    [deployment]
+    [[deployment.rule]]
+    shard = "primary"
+    indexers = ["graph_node"]
+
+    [chains]
+    ingestor = "graph_node"
+
+    [chains.lux]
+    shard = "primary"
+    provider = [
+      { label = "lux-mainnet", url = "http://luxd-0.luxd-headless.lux-mainnet.svc:9630/ext/bc/C/rpc", features = ["archive"] }
+    ]
+---
+# Graph Node — indexes subgraphs (V2 + V3)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: graph-node
+  namespace: lux-explorer
+  labels:
+    app: graph-node
+    component: exchange-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: graph-node
+  serviceName: graph-node
+  template:
+    metadata:
+      labels:
+        app: graph-node
+        component: exchange-backend
+    spec:
+      containers:
+        - name: graph-node
+          image: graphprotocol/graph-node:v0.35.1
+          ports:
+            - containerPort: 8000
+              name: graphql
+            - containerPort: 8001
+              name: ws
+            - containerPort: 8020
+              name: admin
+            - containerPort: 8030
+              name: status
+            - containerPort: 8040
+              name: metrics
+          env:
+            - name: GRAPH_NODE_CONFIG
+              value: "/etc/graph-node/config.toml"
+            - name: node_id
+              value: "graph_node"
+            - name: GRAPH_LOG
+              value: "info"
+            - name: ipfs
+              value: "graph-ipfs.lux-explorer.svc:5001"
+            - name: ETHEREUM_REORG_THRESHOLD
+              value: "1"
+            - name: ETHEREUM_ANCESTOR_COUNT
+              value: "1"
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - mountPath: /etc/graph-node
+              name: config
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8030
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8030
+            initialDelaySeconds: 30
+            periodSeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: graph-node-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: graph-node
+  namespace: lux-explorer
+  labels:
+    app: graph-node
+    component: exchange-backend
+spec:
+  selector:
+    app: graph-node
+  ports:
+    - name: graphql
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+    - name: ws
+      port: 8001
+      targetPort: 8001
+      protocol: TCP
+    - name: admin
+      port: 8020
+      targetPort: 8020
+      protocol: TCP
+    - name: status
+      port: 8030
+      targetPort: 8030
+      protocol: TCP
+  type: ClusterIP
+---
+# Exchange API — REST API serving pool/token/trade data from subgraphs
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: exchange-api
+  namespace: lux-explorer
+  labels:
+    app: exchange-api
+    component: exchange-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: exchange-api
+  template:
+    metadata:
+      labels:
+        app: exchange-api
+        component: exchange-backend
+    spec:
+      imagePullSecrets:
+        - name: ghcr-luxfi
+      containers:
+        - name: exchange-api
+          image: ghcr.io/luxfi/exchange-api:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 4000
+          env:
+            - name: PORT
+              value: "4000"
+            - name: RPC_URL
+              value: "http://luxd-0.luxd-headless.lux-mainnet.svc:9630/ext/bc/C/rpc"
+            - name: BLOCKSCOUT_API
+              value: "https://api-explore.lux.network"
+            - name: SUBGRAPH_URL
+              value: "http://graph-node.lux-explorer.svc:8000/subgraphs/name/luxfi/uniswap-v2"
+            - name: SUBGRAPH_V3_URL
+              value: "http://graph-node.lux-explorer.svc:8000/subgraphs/name/luxfi/uniswap-v3"
+            - name: UNISWAP_API
+              value: "https://interface.gateway.uniswap.org/v1/graphql"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: exchange-api
+  namespace: lux-explorer
+  labels:
+    app: exchange-api
+    component: exchange-backend
+spec:
+  selector:
+    app: exchange-api
+  ports:
+    - port: 4000
+      targetPort: 4000
+      protocol: TCP
+  type: ClusterIP
+---
+# DEX Gateway — live on-chain V3 pool queries + routing
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dex-gateway
+  namespace: lux-explorer
+  labels:
+    app: dex-gateway
+    component: exchange-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dex-gateway
+  template:
+    metadata:
+      labels:
+        app: dex-gateway
+        component: exchange-backend
+    spec:
+      imagePullSecrets:
+        - name: ghcr-luxfi
+      containers:
+        - name: gateway
+          image: ghcr.io/luxfi/dex-gateway:latest
+          imagePullPolicy: Always
+          command: ["./gateway"]
+          args:
+            - "-addr=:8080"
+            - "-lux-rpc=http://luxd-headless.lux-mainnet.svc:9630/ext/bc/C/rpc"
+            - "-zoo-rpc=http://luxd-headless.lux-mainnet.svc:9630/ext/bc/2Y625Kvdd4wZ5LKx9kLSf1jGALyARmXVN1YsTb4F3Hzv4bPDbp/rpc"
+          env:
+            - name: LUX_RPC_URL
+              value: "http://luxd-0.luxd-headless.lux-mainnet.svc:9630/ext/bc/C/rpc"
+            - name: SUBGRAPH_V3_URL
+              value: "http://graph-node.lux-explorer.svc:8000/subgraphs/name/luxfi/uniswap-v3"
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dex-gateway
+  namespace: lux-explorer
+  labels:
+    app: dex-gateway
+    component: exchange-backend
+spec:
+  selector:
+    app: dex-gateway
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP
+---
+# Exchange Proxy — caching reverse proxy for Uniswap APIs (CORS bypass + smart cache)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: exchange-proxy
+  namespace: lux-explorer
+  labels:
+    app: exchange-proxy
+    component: exchange-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: exchange-proxy
+  template:
+    metadata:
+      labels:
+        app: exchange-proxy
+        component: exchange-backend
+    spec:
+      imagePullSecrets:
+        - name: ghcr-luxfi
+      containers:
+        - name: proxy
+          image: ghcr.io/luxfi/exchange-proxy:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8088
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8088
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8088
+            initialDelaySeconds: 5
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: exchange-proxy
+  namespace: lux-explorer
+  labels:
+    app: exchange-proxy
+    component: exchange-backend
+spec:
+  selector:
+    app: exchange-proxy
+  ports:
+    - port: 8088
+      targetPort: 8088
+      protocol: TCP
+  type: ClusterIP
+---
+# Exchange Frontend — Vite SPA served via nginx on port 3000
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lux-exchange
+  namespace: lux-explorer
+  labels:
+    app: lux-exchange
+    component: exchange-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lux-exchange
+  template:
+    metadata:
+      labels:
+        app: lux-exchange
+        component: exchange-backend
+    spec:
+      imagePullSecrets:
+        - name: ghcr-luxfi
+      containers:
+        - name: exchange
+          image: ghcr.io/luxfi/exchange:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: exchange-config
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lux-exchange
+  namespace: lux-explorer
+  labels:
+    app: lux-exchange
+    component: exchange-backend
+spec:
+  selector:
+    app: lux-exchange
+  ports:
+    - port: 3000
+      targetPort: 3000
+      protocol: TCP
+  type: ClusterIP

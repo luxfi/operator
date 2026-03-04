@@ -1,0 +1,5 @@
+FROM --platform=linux/amd64 debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY lux-operator-linux-amd64 /usr/local/bin/lux-operator
+RUN chmod +x /usr/local/bin/lux-operator
+ENTRYPOINT ["lux-operator"]

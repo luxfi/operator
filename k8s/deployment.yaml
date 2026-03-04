@@ -20,7 +20,7 @@ spec:
         - name: ghcr-luxfi
       containers:
         - name: operator
-          image: ghcr.io/luxfi/operator:v0.3.11
+          image: ghcr.io/luxfi/operator:v0.3.12
           imagePullPolicy: Always
           args:
             - --namespace

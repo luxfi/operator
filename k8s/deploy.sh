@@ -58,6 +58,19 @@ for f in "${ROOT_DIR}"/explorer-*.yaml "${ROOT_DIR}"/gateway-*.yaml; do
   [ -f "$f" ] && kubectl apply -f "$f" && echo "  Applied $(basename "$f")"
 done
 
+echo "[deploy] 11) Apply exchange backend (graph-node + IPFS + postgres + exchange-api + dex-gateway)"
+for f in "${ROOT_DIR}"/exchange-backend-*.yaml; do
+  [ -f "$f" ] && kubectl apply -f "$f" && echo "  Applied $(basename "$f")"
+done
+
+echo "[deploy] 12) Wait for exchange backend rollout"
+for deploy in graph-ipfs exchange-api dex-gateway lux-exchange; do
+  kubectl rollout status deployment/"$deploy" -n lux-explorer --timeout=120s 2>/dev/null && echo "  OK: $deploy" || true
+done
+for sts in graph-postgres graph-node; do
+  kubectl rollout status statefulset/"$sts" -n lux-explorer --timeout=120s 2>/dev/null && echo "  OK: $sts" || true
+done
+
 echo "[deploy] done"
 
 echo
@@ -81,6 +94,9 @@ kubectl get luxgateway -A 2>/dev/null || echo "  (none)"
 echo
 echo "[verify] KMS Secrets:"
 kubectl get kmssecrets -A 2>/dev/null || echo "  (KMS operator CRD not installed)"
+echo
+echo "[verify] Exchange Backend:"
+kubectl get pods -n lux-explorer -l component=exchange-backend -o wide 2>/dev/null || echo "  (none)"
 echo
 echo "[verify] Managed Secrets:"
 for ns in lux-system lux-mainnet lux-testnet lux-devnet; do
