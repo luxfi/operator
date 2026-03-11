@@ -1039,7 +1039,10 @@ fn generate_startup_script(network: &LuxNetwork) -> String {
     ));
     s.push_str("ARGS=\"$ARGS --api-keystore-enabled=true\"\n");
     s.push_str("ARGS=\"$ARGS --log-level=info\"\n");
-    s.push_str("ARGS=\"$ARGS --plugin-dir=/data/plugins\"\n");
+    // plugin-dir set conditionally: /plugins for S3 source (set above), /data/plugins for legacy
+    if spec.plugin_source.is_none() {
+        s.push_str("ARGS=\"$ARGS --plugin-dir=/data/plugins\"\n");
+    }
     s.push_str("ARGS=\"$ARGS --staking-tls-cert-file=/data/staking/staker.crt\"\n");
     s.push_str("ARGS=\"$ARGS --staking-tls-key-file=/data/staking/staker.key\"\n\n");
 
@@ -1185,10 +1188,17 @@ fn generate_startup_script(network: &LuxNetwork) -> String {
         s.push_str("echo \"[STAKING] Copied staking keys for pod index ${IDX}\"\n\n");
     }
 
-    // Copy plugins to PVC (ensures correct version on every restart)
-    s.push_str("# Copy plugins to PVC\n");
-    s.push_str("mkdir -p /data/plugins\n");
-    s.push_str("cp /luxd/build/plugins/* /data/plugins/ 2>/dev/null || true\n\n");
+    // Plugin directory setup
+    if spec.plugin_source.is_some() {
+        // S3-sourced plugins: already fetched by init container into /plugins (read-only mount)
+        s.push_str("# Plugins fetched from S3 by init container — mounted read-only at /plugins\n");
+        s.push_str("ARGS=\"$ARGS --plugin-dir=/plugins\"\n\n");
+    } else {
+        // Legacy: copy plugins from image to PVC
+        s.push_str("# Copy plugins to PVC\n");
+        s.push_str("mkdir -p /data/plugins\n");
+        s.push_str("cp /luxd/build/plugins/* /data/plugins/ 2>/dev/null || true\n\n");
+    }
 
     // Start luxd in background
     s.push_str("# Start luxd in background\n");
@@ -2049,6 +2059,23 @@ async fn create_statefulset(network: &LuxNetwork, ctx: &Context) -> Result<()> {
         });
     }
 
+    // S3 plugin source: add shared emptyDir for plugins, mounted read-only by luxd
+    if spec.plugin_source.is_some() {
+        volumes.push(Volume {
+            name: "plugins".to_string(),
+            empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource {
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        volume_mounts.push(VolumeMount {
+            name: "plugins".to_string(),
+            mount_path: "/plugins".to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+    }
+
     // Container uses startup script
     let container = Container {
         name: "luxd".to_string(),
@@ -2312,6 +2339,134 @@ async fn create_statefulset(network: &LuxNetwork, ctx: &Context) -> Result<()> {
             command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
             args: Some(vec![init_script]),
             volume_mounts: Some(init_volume_mounts),
+            ..Default::default()
+        });
+    }
+
+    // S3-based plugin source: init container fetches plugins from S3
+    // VM ID mappings from KMS for live reconfiguration
+    if let Some(ps) = &spec.plugin_source {
+        let mut s3_script = String::from("set -e\n");
+        s3_script.push_str("echo \"=== Fetching plugins from S3 ===\"\n");
+        s3_script.push_str("mkdir -p /plugins\n");
+
+        // Configure S3 endpoint
+        if let Some(endpoint) = &ps.endpoint {
+            s3_script.push_str(&format!("export AWS_ENDPOINT_URL=\"{}\"\n", endpoint));
+        }
+
+        // If KMS config path specified, fetch VM plugin mappings from KMS
+        if let Some(kms_path) = &ps.kms_config_path {
+            s3_script.push_str(&format!(
+                "echo \"[S3-PLUGINS] Fetching plugin config from KMS: {}\"\n", kms_path
+            ));
+            s3_script.push_str(&format!(
+                "PLUGIN_CONFIG=$(curl -sf \"${{KMS_URL}}/v1/secret/data/{}\" \\\n",
+                kms_path
+            ));
+            s3_script.push_str("  -H \"X-Vault-Token: ${VAULT_TOKEN}\" | \\\n");
+            s3_script.push_str("  jq -r '.data.data.plugins // empty')\n");
+            s3_script.push_str("if [ -n \"$PLUGIN_CONFIG\" ]; then\n");
+            s3_script.push_str("  echo \"$PLUGIN_CONFIG\" | jq -c '.[]' | while read -r mapping; do\n");
+            s3_script.push_str("    VM_ID=$(echo \"$mapping\" | jq -r '.vmId')\n");
+            s3_script.push_str("    OBJ_KEY=$(echo \"$mapping\" | jq -r '.objectKey')\n");
+            s3_script.push_str(&format!(
+                "    echo \"[S3-PLUGINS] Downloading $OBJ_KEY -> /plugins/$VM_ID\"\n"
+            ));
+            s3_script.push_str(&format!(
+                "    aws s3 cp \"{}$OBJ_KEY\" \"/plugins/$VM_ID\" --no-sign-request 2>/dev/null || \\\n",
+                ps.bucket
+            ));
+            s3_script.push_str(&format!(
+                "    aws s3 cp \"{}$OBJ_KEY\" \"/plugins/$VM_ID\"\n",
+                ps.bucket
+            ));
+            s3_script.push_str("    chmod 755 /plugins/$VM_ID\n");
+            s3_script.push_str("  done\n");
+            s3_script.push_str("else\n");
+            s3_script.push_str("  echo \"[S3-PLUGINS] No KMS config, using spec mappings\"\n");
+        }
+
+        // Static plugin mappings from spec (fallback if no KMS config)
+        let has_kms = ps.kms_config_path.is_some();
+        if has_kms {
+            s3_script.push_str("  # Fallback to spec-defined mappings\n");
+        }
+
+        if ps.vm_plugins.is_empty() {
+            // Default: fetch single EVM plugin binary, link to both VM IDs
+            s3_script.push_str(&format!(
+                "  aws s3 cp \"{}evm-plugin\" /plugins/{} 2>/dev/null || \\\n",
+                ps.bucket, C_CHAIN_VM_ID
+            ));
+            s3_script.push_str(&format!(
+                "  aws s3 cp \"{}evm-plugin\" /plugins/{}\n",
+                ps.bucket, C_CHAIN_VM_ID
+            ));
+            s3_script.push_str(&format!(
+                "  ln -sf /plugins/{} /plugins/{}\n",
+                C_CHAIN_VM_ID, CHAIN_VM_ID
+            ));
+            s3_script.push_str(&format!("  chmod 755 /plugins/{}\n", C_CHAIN_VM_ID));
+        } else {
+            for mapping in &ps.vm_plugins {
+                s3_script.push_str(&format!(
+                    "  aws s3 cp \"{}{}\" \"/plugins/{}\" 2>/dev/null || \\\n",
+                    ps.bucket, mapping.object_key, mapping.vm_id
+                ));
+                s3_script.push_str(&format!(
+                    "  aws s3 cp \"{}{}\" \"/plugins/{}\"\n",
+                    ps.bucket, mapping.object_key, mapping.vm_id
+                ));
+                s3_script.push_str(&format!("  chmod 755 /plugins/{}\n", mapping.vm_id));
+            }
+        }
+
+        if has_kms {
+            s3_script.push_str("fi\n");
+        }
+        s3_script.push_str("echo \"=== Plugin fetch complete ===\"\n");
+        s3_script.push_str("ls -la /plugins/\n");
+
+        let mut s3_env = vec![];
+        if let Some(cred_secret) = &ps.credentials_secret {
+            s3_env.push(k8s_openapi::api::core::v1::EnvVar {
+                name: "AWS_ACCESS_KEY_ID".to_string(),
+                value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
+                    secret_key_ref: Some(k8s_openapi::api::core::v1::SecretKeySelector {
+                        name: Some(cred_secret.clone()),
+                        key: "AWS_ACCESS_KEY_ID".to_string(),
+                        optional: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            s3_env.push(k8s_openapi::api::core::v1::EnvVar {
+                name: "AWS_SECRET_ACCESS_KEY".to_string(),
+                value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
+                    secret_key_ref: Some(k8s_openapi::api::core::v1::SecretKeySelector {
+                        name: Some(cred_secret.clone()),
+                        key: "AWS_SECRET_ACCESS_KEY".to_string(),
+                        optional: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+
+        init_containers.push(Container {
+            name: "fetch-plugins".to_string(),
+            image: Some("amazon/aws-cli:latest".to_string()),
+            command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+            args: Some(vec![s3_script]),
+            env: Some(s3_env),
+            volume_mounts: Some(vec![VolumeMount {
+                name: "plugins".to_string(),
+                mount_path: "/plugins".to_string(),
+                ..Default::default()
+            }]),
             ..Default::default()
         });
     }

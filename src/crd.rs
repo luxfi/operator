@@ -88,6 +88,11 @@ pub struct LuxNetworkSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init: Option<InitSpec>,
 
+    /// S3-based plugin source — replaces init container plugin copy.
+    /// Plugins fetched from S3, VM ID mappings from KMS for live reconfigure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_source: Option<PluginSource>,
+
     /// Startup script ConfigMap name (custom entrypoint, overrides generated script)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_script: Option<String>,
@@ -628,7 +633,7 @@ pub struct InitSpec {
     #[serde(default = "default_init_pull_policy")]
     pub pull_policy: String,
 
-    /// Plugin binary names to copy from init image
+    /// Plugin binary names to copy from init image (legacy, prefer plugin_source)
     #[serde(default)]
     pub plugins: Vec<PluginSpec>,
 
@@ -641,7 +646,7 @@ fn default_init_pull_policy() -> String {
     "IfNotPresent".to_string()
 }
 
-/// Plugin specification
+/// Plugin specification (legacy: copy from init image)
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginSpec {
@@ -649,6 +654,44 @@ pub struct PluginSpec {
     pub source: String,
     /// Destination filename in /data/plugins/
     pub dest: String,
+}
+
+/// S3-based plugin source — plugins fetched from S3 at pod startup.
+/// VM ID mappings stored in KMS for live reconfiguration.
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginSource {
+    /// S3 bucket URL (e.g. "s3://lux-plugins/v1.23.24/")
+    pub bucket: String,
+
+    /// S3 endpoint override (for Hanzo S3 / MinIO)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+
+    /// S3 credentials secret name (keys: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credentials_secret: Option<String>,
+
+    /// VM ID plugin mappings: maps VM ID filename → S3 object key.
+    /// If empty, uses default C-chain + subnet EVM mappings.
+    /// These can also be read from KMS at runtime.
+    #[serde(default)]
+    pub vm_plugins: Vec<VmPluginMapping>,
+
+    /// KMS key path for dynamic VM plugin config (overrides vm_plugins at runtime)
+    /// Format: "lux/{network}/plugins" — KMS returns JSON array of VmPluginMapping
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kms_config_path: Option<String>,
+}
+
+/// Maps a VM ID to its plugin binary in S3
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct VmPluginMapping {
+    /// VM ID (filename in plugin dir, e.g. "mgj786NP7uDwBCcq6YwThhaN8FLyybkCa4zBWTQbNgmK6k9A6")
+    pub vm_id: String,
+    /// S3 object key (e.g. "evm-plugin-linux-amd64")
+    pub object_key: String,
 }
 
 /// Security context configuration
