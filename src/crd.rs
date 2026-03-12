@@ -125,6 +125,12 @@ pub struct LuxNetworkSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evm_config: Option<serde_json::Value>,
 
+    /// EVM chain upgrade config (upgrade.json) written to each chain's config directory.
+    /// Contains precompileUpgrades and/or networkUpgradeOverrides for EVM chains.
+    /// Applied to C-chain and all tracked chains.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_upgrade_config: Option<serde_json::Value>,
+
     /// Gateway integration configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway: Option<GatewaySpec>,

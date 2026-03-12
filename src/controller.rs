@@ -984,6 +984,32 @@ fn generate_startup_script(network: &LuxNetwork) -> String {
                 .collect::<Vec<_>>()
                 .join(" + ")
         ));
+
+        // Write chain upgrade config (upgrade.json with precompileUpgrades) to each chain dir
+        if let Some(chain_upgrade) = &spec.chain_upgrade_config {
+            let upgrade_json = serde_json::to_string(chain_upgrade).unwrap_or_default();
+            s.push_str("# Write chain upgrade config (precompile activations)\n");
+            s.push_str(&format!(
+                "CHAIN_UPGRADE='{}'\n",
+                upgrade_json.replace('\'', "'\"'\"'")
+            ));
+            s.push_str(&format!(
+                "for chain in {}; do\n",
+                chains.join(" ")
+            ));
+            s.push_str("  echo \"$CHAIN_UPGRADE\" > /data/configs/chains/$chain/upgrade.json\n");
+            s.push_str("done\n");
+            let n_precompiles = chain_upgrade
+                .get("precompileUpgrades")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            s.push_str(&format!(
+                "echo \"Chain upgrade config written ({} precompile upgrades) for {} chains\"\n\n",
+                n_precompiles,
+                chains.len()
+            ));
+        }
     }
 
     s.push_str("echo \"  public-ip: $PUBLIC_IP\"\n");

@@ -56,3 +56,53 @@ spec:
 
   chainTracking:
     trackAllChains: true
+
+  # EVM chains (C-chain always included, plus subnet chains)
+  chains:
+    - blockchainId: "2caKCdNop9C4oAPR1kYihN53HeSRDXD3JyMKS7ntfcpQYucmii"
+      alias: zoo
+      trackingId: "2fH7asshEiEQvvtGijkYeP6Xo7yhswrEqDsdrjLkMAjkgMGjiX"
+    - blockchainId: "tecXMucYDxwN65mebPE6cvQ9GynG6Y5WEvwGFsY3xVDWHxiqT"
+      alias: hanzo
+      trackingId: "25dBp99WA9mosjtQztswkpSyo4EeXt33Wz4FzsGHgyZvPQ1LZ"
+    - blockchainId: "213ZsFLRCBSmrii4huQqa6S3SxYPP8ec6dPEn6ad4CtLk3RdXp"
+      alias: spc
+      trackingId: "2g8raSjc4w4KiUHJuAHT3cFyGBBwkM7gWEWuQiLYn9BPzWw4S"
+    - blockchainId: "MEGAgimfcodi7QaqCruFpTkNM6fqu7ZduLmWJJjGQwUg8uDPJ"
+      alias: pars
+      trackingId: "2VwLcANTM8QvS656K9YsiZEGFXn3MRk2cA5pG3Q4DaiwZPt4tb"
+
+  # Platform upgrade config
+  upgradeConfig:
+    durangoTimestamp: 0
+    etnaTimestamp: 0
+    fortunaTimestamp: 0
+    graniteTimestamp: 0
+
+  # EVM chain upgrade config with all precompile activations
+  chainUpgradeConfig:
+    networkUpgradeOverrides:
+      durangoTimestamp: 0
+      etnaTimestamp: 0
+      fortunaTimestamp: 0
+      graniteTimestamp: 0
+    precompileUpgrades:
+      - aiMiningConfig: {blockTimestamp: 0}
+      - blake3Config: {blockTimestamp: 0}
+      - cggmp21Verify: {blockTimestamp: 0}
+      - deadZeroConfig: {blockTimestamp: 0}
+      - deadConfig: {blockTimestamp: 0}
+      - deadFullConfig: {blockTimestamp: 0}
+      - dexConfig: {blockTimestamp: 0}
+      - eciesConfig: {blockTimestamp: 0}
+      - fheConfig: {blockTimestamp: 0}
+      - frostVerify: {blockTimestamp: 0}
+      - graphConfig: {blockTimestamp: 0}
+      - hpkeConfig: {blockTimestamp: 0}
+      - mldsaVerify: {blockTimestamp: 0}
+      - mlkemConfig: {blockTimestamp: 0}
+      - pqcryptoConfig: {blockTimestamp: 0}
+      - ringConfig: {blockTimestamp: 0}
+      - ringtailThreshold: {blockTimestamp: 0}
+      - slhdsaVerify: {blockTimestamp: 0}
+      - zkConfig: {blockTimestamp: 0}

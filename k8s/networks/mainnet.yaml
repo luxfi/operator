@@ -56,3 +56,53 @@ spec:
 
   chainTracking:
     trackAllChains: true
+
+  # EVM chains (C-chain always included, plus subnet chains)
+  chains:
+    - blockchainId: "2Y625Kvdd4wZ5LKx9kLSf1jGALyARmXVN1YsTb4F3Hzv4bPDbp"
+      alias: zoo
+      trackingId: "wd5JS1Buow7TJkm77nRJFwyQzreNoicsVeViS5RVLBRkhfJb"
+    - blockchainId: "2GiQb73CeJESjc4omFv2YtQHZrRgJf25NXPzAr5J6UNHRcDV2F"
+      alias: hanzo
+      trackingId: "V7CjnUWqFsBpFvHkNothj9JJcB1TMAuZyv4PNH1FhAbc7etz7"
+    - blockchainId: "rtjwvtE1tEvrokmpeYdTq7b2zqZgmybKwR5MLjKMGAR1W78dQ"
+      alias: spc
+      trackingId: "oaYjfamxSzyxs4MXdoAiymfgJPu6GPUriBj9s83B8ejia1zMR"
+    - blockchainId: "2pUskxqaL5Bpx7uRUGG1fDjPckjxQ4UKX4sLKeaS1NdSVBJd3F"
+      alias: pars
+      trackingId: "2iEn4tKFWNswMGub1iFF8D9xp9KDGr6TcA7hefcX4ReLpG5nZF"
+
+  # Platform upgrade config (Durango/Etna/Fortuna/Granite active from genesis)
+  upgradeConfig:
+    durangoTimestamp: 0
+    etnaTimestamp: 0
+    fortunaTimestamp: 0
+    graniteTimestamp: 0
+
+  # EVM chain upgrade config with all precompile activations
+  chainUpgradeConfig:
+    networkUpgradeOverrides:
+      durangoTimestamp: 0
+      etnaTimestamp: 0
+      fortunaTimestamp: 0
+      graniteTimestamp: 0
+    precompileUpgrades:
+      - aiMiningConfig: {blockTimestamp: 0}
+      - blake3Config: {blockTimestamp: 0}
+      - cggmp21Verify: {blockTimestamp: 0}
+      - deadZeroConfig: {blockTimestamp: 0}
+      - deadConfig: {blockTimestamp: 0}
+      - deadFullConfig: {blockTimestamp: 0}
+      - dexConfig: {blockTimestamp: 0}
+      - eciesConfig: {blockTimestamp: 0}
+      - fheConfig: {blockTimestamp: 0}
+      - frostVerify: {blockTimestamp: 0}
+      - graphConfig: {blockTimestamp: 0}
+      - hpkeConfig: {blockTimestamp: 0}
+      - mldsaVerify: {blockTimestamp: 0}
+      - mlkemConfig: {blockTimestamp: 0}
+      - pqcryptoConfig: {blockTimestamp: 0}
+      - ringConfig: {blockTimestamp: 0}
+      - ringtailThreshold: {blockTimestamp: 0}
+      - slhdsaVerify: {blockTimestamp: 0}
+      - zkConfig: {blockTimestamp: 0}
